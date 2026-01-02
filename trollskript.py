@@ -529,11 +529,18 @@ def copy_with_policy(
         if collision_policy == "conflicts":
             conflicts_dir.mkdir(parents=True, exist_ok=True)
 
+        # Track media file renames so sidecars can follow: group_id -> (old_stem, new_stem, new_parent)
+        media_renames: dict[str, tuple[str, str, Path]] = {}
+
+        # First pass: process media files to determine renames
         applied: list[dict[str, Any]] = []
         for c in collisions:
             src = Path(c["src"])
             dst = Path(c["dst"])
             src_hash = c["src_hash"]
+            kind = c["kind"]
+            group_id = c["group_id"]
+
             if src_hash in seen_hashes:
                 applied.append({**c, "final_status": "skipped_duplicate_after_policy", "final_dst": None})
                 continue
@@ -542,10 +549,21 @@ def copy_with_policy(
                 applied.append({**c, "final_status": "skipped_collision", "final_dst": None})
                 continue
 
-            if collision_policy == "rename":
+            # Determine final destination
+            if kind == "sidecar" and group_id in media_renames:
+                # Sidecar follows its media file's rename
+                old_stem, new_stem, new_parent = media_renames[group_id]
+                new_name = dst.name.replace(old_stem, new_stem, 1)
+                final_dst = new_parent / new_name
+                final_dst = _ensure_unique_path(final_dst)
+            elif collision_policy == "rename":
                 final_dst = _ensure_unique_path(dst)
             else:
                 final_dst = _ensure_unique_path(conflicts_dir / dst.name)
+
+            # Track media file renames for sidecars to follow
+            if kind == "media" and final_dst.stem != dst.stem:
+                media_renames[group_id] = (dst.stem, final_dst.stem, final_dst.parent)
 
             final_dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, final_dst)
