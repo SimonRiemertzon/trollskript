@@ -205,13 +205,18 @@ def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
     try:
         # Separate stdout (JSON) from stderr (warnings)
         result = subprocess.run(cmd, capture_output=True)
-        out = result.stdout
     except FileNotFoundError:
         raise RuntimeError(
             "ExifTool not found. Install `exiftool` (Linux: apt install libimage-exiftool-perl) "
             "or place `exiftool.exe` next to this script (Windows)."
         )
 
+    # Fail fast if exiftool returned an error
+    if result.returncode != 0:
+        stderr_msg = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ExifTool failed (exit code {result.returncode}): {stderr_msg}")
+
+    out = result.stdout
     if not out.strip():
         return []
 
