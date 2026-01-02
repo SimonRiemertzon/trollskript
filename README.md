@@ -1,6 +1,6 @@
 ## trollskript (photo/video sorter)
 
-Minimal, non-destructive CLI tool that **copies** media files (images/videos/RAW) into `YYYY/MM/DD/` folders based on metadata dates (via ExifTool). Files with no date go to `unknown_date/`. Sidecars (like `.xmp`, `.aae`) are copied alongside their media. Content duplicates are skipped via SHA-256 hashing.
+Minimal, non-destructive CLI tool that **copies** media files (images/videos/RAW) into `YYYY-MM-DD -` folders based on metadata dates (via ExifTool). Files with no date go to `unknown_date/`. Sidecars (like `.xmp`, `.aae`) are copied alongside their media. Content duplicates are skipped via SHA-256 hashing.
 
 **Zero Python dependencies** – runs with just Python 3.9+.
 
