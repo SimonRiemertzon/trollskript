@@ -1,34 +1,29 @@
- name: Build Windows Executable
-   # When does this run?
-   on:
-     release:
-       types: [published]  # Triggers when you publish a release
-   jobs:
-     build-windows:
-       runs-on: windows-latest  # Use a Windows machine
+name: Build Windows Executable
 
-       steps:
-         # 1. Get your code
-         - name: Checkout code
-           uses: actions/checkout@v4
+on:
+  release:
+    types: [published]
 
-         # 2. Set up Python
-         - name: Set up Python
-           uses: actions/setup-python@v5
-           with:
-             python-version: '3.11'
+jobs:
+  build-windows:
+    runs-on: windows-latest
 
-         # 3. Install PyInstaller
-         - name: Install PyInstaller
-           run: pip install pyinstaller
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-         # 4. Build the .exe
-         - name: Build executable
-           run: pyinstaller --onefile --name trollskript trollskript.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-         # 5. Upload to the release
-         - name: Upload to Release
-           uses: softprops/action-gh-release@v1
-           with:
-             files: dist/trollskript.exe
-             
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --name trollskript trollskript.py
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/trollskript.exe
