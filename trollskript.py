@@ -50,10 +50,6 @@ def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -257,7 +253,7 @@ def _folder_for_item(base_out: Path, item: MediaItem) -> Path:
     dt = item.exif_date
     # If tz-aware, group by local date in that timezone; if naive, use as-is.
     y, m, d = dt.year, dt.month, dt.day
-    return base_out / f"{y:04d}" / f"{m:02d}" / f"{y:04d}-{m:02d}-{d:02d}"
+    return base_out / f"{y:04d}-{m:02d}-{d:02d} -"
 
 
 def _ensure_unique_path(dst: Path) -> Path:
@@ -314,17 +310,14 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
     return idx
 
 
-def plan_copies(items: list[MediaItem], base_out: Path) -> tuple[list[PlannedCopy], set[int], set[int]]:
+def plan_copies(items: list[MediaItem], base_out: Path) -> tuple[list[PlannedCopy], set[int]]:
     plans: list[PlannedCopy] = []
     years_with_date: set[int] = set()
-    years_all: set[int] = set()
 
     for item in items:
         if item.exif_date is not None:
             years_with_date.add(item.exif_date.year)
         dst_dir = _folder_for_item(base_out, item)
-        if item.exif_date is not None:
-            years_all.add(item.exif_date.year)
 
         group_id = hashlib.sha1(str(item.src).encode("utf-8", errors="replace")).hexdigest()[:12]
         plans.append(
@@ -345,7 +338,7 @@ def plan_copies(items: list[MediaItem], base_out: Path) -> tuple[list[PlannedCop
                 )
             )
 
-    return plans, years_with_date, years_all
+    return plans, years_with_date
 
 
 
@@ -373,6 +366,11 @@ def _write_found_list(out_dir: Path, items: list[MediaItem]) -> None:
             for i in items
         ],
     )
+
+
+def _make_entry(plan: PlannedCopy, **extra: Any) -> dict[str, Any]:
+    """Create a report/log entry with common fields from a PlannedCopy."""
+    return {"src": str(plan.src), "dst": str(plan.dst), "kind": plan.kind, "group_id": plan.group_id, **extra}
 
 
 def copy_with_policy(
@@ -405,38 +403,12 @@ def copy_with_policy(
         try:
             src_hash = _hash_file(plan.src)
         except OSError as e:
-            report.append(
-                {
-                    "status": "error",
-                    "src": str(plan.src),
-                    "dst": str(plan.dst),
-                    "error": str(e),
-                    "kind": plan.kind,
-                    "group_id": plan.group_id,
-                }
-            )
+            report.append(_make_entry(plan, status="error", error=str(e)))
             continue
 
         if src_hash in seen_hashes:
-            duplicates.append(
-                {
-                    "src": str(plan.src),
-                    "existing": seen_hashes[src_hash],
-                    "hash": src_hash,
-                    "kind": plan.kind,
-                    "group_id": plan.group_id,
-                }
-            )
-            report.append(
-                {
-                    "status": "skipped_duplicate",
-                    "src": str(plan.src),
-                    "dst": str(plan.dst),
-                    "hash": src_hash,
-                    "kind": plan.kind,
-                    "group_id": plan.group_id,
-                }
-            )
+            duplicates.append(_make_entry(plan, existing=seen_hashes[src_hash], hash=src_hash))
+            report.append(_make_entry(plan, status="skipped_duplicate", hash=src_hash))
             continue
 
         if plan.dst.exists():
@@ -446,51 +418,15 @@ def copy_with_policy(
                 dst_hash = None
             if dst_hash == src_hash:
                 seen_hashes[src_hash] = str(plan.dst)
-                report.append(
-                    {
-                        "status": "already_present_same_content",
-                        "src": str(plan.src),
-                        "dst": str(plan.dst),
-                        "hash": src_hash,
-                        "kind": plan.kind,
-                        "group_id": plan.group_id,
-                    }
-                )
+                report.append(_make_entry(plan, status="already_present_same_content", hash=src_hash))
                 continue
-            collisions.append(
-                {
-                    "src": str(plan.src),
-                    "dst": str(plan.dst),
-                    "src_hash": src_hash,
-                    "dst_hash": dst_hash,
-                    "kind": plan.kind,
-                    "group_id": plan.group_id,
-                }
-            )
-            report.append(
-                {
-                    "status": "collision_deferred",
-                    "src": str(plan.src),
-                    "dst": str(plan.dst),
-                    "hash": src_hash,
-                    "kind": plan.kind,
-                    "group_id": plan.group_id,
-                }
-            )
+            collisions.append(_make_entry(plan, src_hash=src_hash, dst_hash=dst_hash))
+            report.append(_make_entry(plan, status="collision_deferred", hash=src_hash))
             continue
 
         shutil.copy2(plan.src, plan.dst)
         seen_hashes[src_hash] = str(plan.dst)
-        report.append(
-            {
-                "status": "copied",
-                "src": str(plan.src),
-                "dst": str(plan.dst),
-                "hash": src_hash,
-                "kind": plan.kind,
-                "group_id": plan.group_id,
-            }
-        )
+        report.append(_make_entry(plan, status="copied", hash=src_hash))
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     _write_json(logs_dir / "report.json", report)
@@ -612,7 +548,7 @@ def main() -> int:
 
     _write_found_list(logs_dir, items)
 
-    plans, years_with_date, _years_all = plan_copies(items, base_out=base_out)
+    plans, years_with_date = plan_copies(items, base_out=base_out)
 
     if years_with_date:
         years_sorted = sorted(years_with_date)
