@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import io
 import json
 import os
 import shutil
+import string
 import subprocess
 import sys
 import urllib.request
@@ -48,6 +50,88 @@ def _script_dir() -> Path:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _get_volume_label(drive: str) -> str:
+    """Get the volume label for a drive on Windows. Returns empty string on failure."""
+    if sys.platform != "win32":
+        return ""
+    volume_name_buf = ctypes.create_unicode_buffer(261)
+    result = ctypes.windll.kernel32.GetVolumeInformationW(
+        drive, volume_name_buf, 261, None, None, None, None, 0
+    )
+    return volume_name_buf.value if result else ""
+
+
+def _get_removable_drives() -> list[tuple[str, str]]:
+    """
+    Detect removable drives on Windows (USB drives, SD cards).
+    Returns list of (drive_path, volume_label) tuples.
+    """
+    if sys.platform != "win32":
+        return []
+    drives = []
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    for letter in string.ascii_uppercase:
+        if bitmask & 1:
+            drive = f"{letter}:\\"
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+            # DriveType 2 = DRIVE_REMOVABLE
+            if drive_type == 2:
+                label = _get_volume_label(drive)
+                drives.append((drive, label))
+        bitmask >>= 1
+    return drives
+
+
+def _run_interactive_mode() -> tuple[Path, Path] | None:
+    """
+    Interactive mode for Windows double-click usage.
+    Shows welcome message, lists removable drives, prompts user to select one.
+    Returns (source_path, dest_path) or None if cancelled/no drives found.
+    """
+    print("=" * 50)
+    print("  TrollSkript - Photo/Video Sorter")
+    print("=" * 50)
+    print()
+    print("This tool copies photos and videos from a removable")
+    print("drive (USB/SD card) into date-based folders.")
+    print()
+
+    dest = _script_dir()
+    print(f"Destination: {dest}")
+    print()
+
+    drives = _get_removable_drives()
+    if not drives:
+        print("No removable drives found!")
+        print("Please insert a USB drive or SD card and try again.")
+        return None
+
+    print("Available removable drives:")
+    for i, (drive_path, label) in enumerate(drives, 1):
+        display_label = f" ({label})" if label else ""
+        print(f"  {i}. {drive_path}{display_label}")
+    print()
+
+    while True:
+        try:
+            choice = input(f"Select drive [1-{len(drives)}] or 'q' to quit: ").strip()
+            if choice.lower() == "q":
+                print("Cancelled.")
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(drives):
+                src = Path(drives[idx][0])
+                print()
+                print(f"Source: {src}")
+                print(f"Destination: {dest}")
+                print()
+                return src, dest
+            else:
+                print(f"Please enter a number between 1 and {len(drives)}")
+        except ValueError:
+            print(f"Please enter a number between 1 and {len(drives)} or 'q' to quit")
 
 
 def _write_json(path: Path, obj: Any) -> None:
@@ -466,7 +550,20 @@ def copy_with_policy(
         _write_json(logs_dir / "collisions_applied.json", applied)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace | None:
+    # Interactive mode: no arguments provided (e.g., double-clicked on Windows)
+    if len(sys.argv) == 1:
+        result = _run_interactive_mode()
+        if result is None:
+            return None
+        src, dest = result
+        return argparse.Namespace(
+            src=src,
+            dest=dest,
+            top_folder=None,
+            collision_policy="skip",
+        )
+
     parser = argparse.ArgumentParser(
         description="Sort photos/videos into YYYY/MM/DD folders based on EXIF metadata.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -508,6 +605,8 @@ Examples:
 
 def main() -> int:
     args = parse_args()
+    if args is None:
+        return 0  # User cancelled interactive mode
 
     # Source: command line or script directory
     src_root = args.src.resolve() if args.src else _script_dir()
@@ -573,6 +672,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    # Keep console window open when double-clicked on Windows (interactive mode)
+    if len(sys.argv) == 1:
+        print()
+        input("Press Enter to exit...")
+    raise SystemExit(exit_code)
 
 
