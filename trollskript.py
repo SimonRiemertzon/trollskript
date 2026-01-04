@@ -21,6 +21,18 @@ from typing import Any, Iterable
 
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
 
+# Common media file extensions for duplicate detection in destination
+# Only files with these extensions will be indexed (much faster than hashing everything)
+MEDIA_EXTENSIONS = {
+    # Images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".heic", ".heif", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng",
+    ".orf", ".rw2", ".pef", ".srw", ".raf",
+    # Videos
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".mts", ".m2ts",
+}
+
 EXIF_DATE_TAGS_PRIORITY = [
     "DateTimeOriginal",
     "MediaCreateDate",
@@ -577,7 +589,8 @@ def _hash_file(path: Path) -> str:
 
 def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
     """
-    Returns hash -> [paths...] for files already present in destination.
+    Returns hash -> [paths...] for media files already present in destination.
+    Only indexes files with known media extensions for performance.
     """
     idx: dict[str, list[str]] = {}
     if not dest_root.exists():
@@ -591,16 +604,31 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
         "collisions.json",
         "collisions_applied.json",
     }
-    for p in _walk_files(dest_root):
-        if not p.is_file():
-            continue
-        if p.name in skip_names:
-            continue
+    
+    # First collect all media files (fast)
+    all_files = _walk_files(dest_root)
+    media_files = [
+        p for p in all_files
+        if p.suffix.lower() in MEDIA_EXTENSIONS
+        and p.name not in skip_names
+        and p.is_file()
+    ]
+    
+    if not media_files:
+        return idx
+    
+    # Hash files with progress indicator
+    total = len(media_files)
+    for i, p in enumerate(media_files, 1):
+        if i % 50 == 0 or i == total:
+            print(f"  Indexing {i}/{total} media files...", end="\r", flush=True)
         try:
             hx = _hash_file(p)
         except OSError:
             continue
         idx.setdefault(hx, []).append(str(p))
+    
+    print(f"  Indexing {total}/{total} media files... done", flush=True)
     return idx
 
 
