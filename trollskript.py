@@ -139,6 +139,17 @@ def _write_json(path: Path, obj: Any) -> None:
 
 
 EXIFTOOL_VER_URL = "https://exiftool.org/ver.txt"
+EXIFTOOL_INSTALL_DIR_NAME = "exiftool"
+
+
+def _get_exiftool_install_dir() -> Path:
+    """Get the common installation directory for ExifTool on Windows."""
+    # Use %LOCALAPPDATA%\exiftool (e.g., C:\Users\<user>\AppData\Local\exiftool)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / EXIFTOOL_INSTALL_DIR_NAME
+    # Fallback to user home directory
+    return Path.home() / ".exiftool"
 
 
 def _get_exiftool_download_url() -> str:
@@ -152,8 +163,19 @@ def _get_exiftool_download_url() -> str:
         return "https://exiftool.org/exiftool-13.45_64.zip"
 
 
+def _find_exiftool_exe(search_dir: Path) -> Path | None:
+    """Search for ExifTool executable under search_dir. Prefers exiftool(-k).exe."""
+    # Look for exiftool(-k).exe first (the default name in the ZIP)
+    for exe in search_dir.rglob("exiftool(-k).exe"):
+        return exe
+    # Fallback to exiftool.exe
+    for exe in search_dir.rglob("exiftool.exe"):
+        return exe
+    return None
+
+
 def _download_exiftool_windows(dest_dir: Path) -> Path:
-    """Download and extract exiftool for Windows. Returns path to exiftool.exe."""
+    """Download and extract exiftool for Windows. Returns path to exiftool executable."""
     url = _get_exiftool_download_url()
     print(f"Downloading ExifTool from {url}...")
     try:
@@ -162,45 +184,79 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
     except Exception as e:
         raise RuntimeError(f"Failed to download ExifTool: {e}")
 
+    # Create destination directory if it doesn't exist
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
     print("Extracting ExifTool...")
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for member in zf.namelist():
-            # The zip contains exiftool(-k).exe, rename to exiftool.exe
-            if member.lower().endswith(".exe"):
-                exe_data = zf.read(member)
-                exe_path = dest_dir / "exiftool.exe"
-                exe_path.write_bytes(exe_data)
-                print(f"ExifTool installed to: {exe_path}")
-                return exe_path
-    raise RuntimeError("No .exe found in ExifTool zip")
+        # Extract everything to preserve DLLs and support files
+        zf.extractall(dest_dir)
+
+    # Find the extracted executable
+    exe_path = _find_exiftool_exe(dest_dir)
+    if exe_path is None:
+        raise RuntimeError("No ExifTool executable found after extraction")
+
+    print(f"ExifTool installed to: {exe_path}")
+    return exe_path
 
 
-def _exiftool_path(auto_download: bool = True) -> str:
-    """Get path to exiftool. On Windows, auto-downloads if not found."""
-    here = _script_dir()
-    win_exe = here / "exiftool.exe"
+def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str:
+    """Get path to exiftool. On Windows, prompts user to install if not found."""
+    # 1. Check common installation directory on Windows
+    if sys.platform == "win32":
+        install_dir = _get_exiftool_install_dir()
+        existing_exe = _find_exiftool_exe(install_dir)
+        if existing_exe:
+            return str(existing_exe)
 
-    if win_exe.exists():
-        return str(win_exe)
+    # 2. Check if exiftool is in PATH
+    import shutil
+    if shutil.which("exiftool"):
+        return "exiftool"
 
-    # On Windows, try to auto-download
-    if auto_download and sys.platform == "win32":
-        try:
-            _download_exiftool_windows(here)
-            if win_exe.exists():
-                return str(win_exe)
-        except Exception as e:
-            print(f"Warning: Auto-download of ExifTool failed: {e}")
+    # 3. ExifTool not found - on Windows, offer to install
+    if sys.platform == "win32" and auto_download:
+        install_dir = _get_exiftool_install_dir()
+        print("\n" + "=" * 60)
+        print("ExifTool is required but not installed.")
+        print(f"Install location: {install_dir}")
+        print("=" * 60)
 
-    return "exiftool"
+        if interactive:
+            response = input("\nWould you like to install ExifTool now? [Y/n]: ").strip().lower()
+            if response in ("", "y", "yes", "ja", "j"):
+                try:
+                    exe_path = _download_exiftool_windows(install_dir)
+                    return str(exe_path)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to install ExifTool: {e}")
+            else:
+                raise RuntimeError(
+                    "ExifTool is required to run this script. "
+                    "Please install it manually or re-run and accept the installation."
+                )
+        else:
+            # Non-interactive mode: auto-install without prompting
+            try:
+                exe_path = _download_exiftool_windows(install_dir)
+                return str(exe_path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to auto-install ExifTool: {e}")
+
+    # 4. Not on Windows and not in PATH
+    raise RuntimeError(
+        "ExifTool is required but not found. "
+        "Please install it: https://exiftool.org/"
+    )
 
 
-def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
+def _run_exiftool_json(paths: list[Path], interactive: bool = False) -> list[dict[str, Any]]:
     if not paths:
         return []
 
     cmd = [
-        _exiftool_path(),
+        _exiftool_path(interactive=interactive),
         "-json",
         "-api",
         "largefilesupport=1",
@@ -318,12 +374,12 @@ def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
         yield it[i : i + n]
 
 
-def discover_media(root: Path, exclude_dirs: list[Path] | None = None) -> list[MediaItem]:
+def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interactive: bool = False) -> list[MediaItem]:
     all_files = _walk_files_excluding(root, exclude_dirs or [])
     items: list[MediaItem] = []
 
     for batch in _batched(all_files, 200):
-        metas = _run_exiftool_json(batch)
+        metas = _run_exiftool_json(batch, interactive=interactive)
         for meta in metas:
             directory = meta.get("Directory")
             filename = meta.get("FileName")
@@ -597,6 +653,7 @@ def parse_args() -> argparse.Namespace | None:
             dest=dest,
             top_folder=None,
             collision_policy="skip",
+            interactive=True,
         )
 
     parser = argparse.ArgumentParser(
@@ -635,7 +692,9 @@ Examples:
         default="skip",
         help="How to handle filename collisions: skip (default), rename (add suffix), conflicts (copy to conflicts/)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.interactive = False  # CLI mode is not interactive
+    return args
 
 
 def main() -> int:
@@ -673,7 +732,7 @@ def main() -> int:
         pass
 
     print("Scanning for media files...")
-    items = discover_media(src_root, exclude_dirs=exclude_dirs)
+    items = discover_media(src_root, exclude_dirs=exclude_dirs, interactive=args.interactive)
     print(f"Found {len(items)} media file(s)")
 
     if not items:
