@@ -138,14 +138,26 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-EXIFTOOL_WIN_URL = "https://exiftool.org/exiftool-13.28_64.zip"
+EXIFTOOL_VER_URL = "https://exiftool.org/ver.txt"
+
+
+def _get_exiftool_download_url() -> str:
+    """Fetch the latest ExifTool version and return the download URL."""
+    try:
+        with urllib.request.urlopen(EXIFTOOL_VER_URL, timeout=30) as resp:
+            version = resp.read().decode("utf-8").strip()
+        return f"https://exiftool.org/exiftool-{version}_64.zip"
+    except Exception:
+        # Fallback to a known version if we can't fetch the latest
+        return "https://exiftool.org/exiftool-13.45_64.zip"
 
 
 def _download_exiftool_windows(dest_dir: Path) -> Path:
     """Download and extract exiftool for Windows. Returns path to exiftool.exe."""
-    print(f"Downloading ExifTool from {EXIFTOOL_WIN_URL}...")
+    url = _get_exiftool_download_url()
+    print(f"Downloading ExifTool from {url}...")
     try:
-        with urllib.request.urlopen(EXIFTOOL_WIN_URL, timeout=60) as resp:
+        with urllib.request.urlopen(url, timeout=60) as resp:
             data = resp.read()
     except Exception as e:
         raise RuntimeError(f"Failed to download ExifTool: {e}")
@@ -695,9 +707,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    exit_code = main()
+    interactive_mode = len(sys.argv) == 1
+    try:
+        exit_code = main()
+    except Exception as e:
+        print(f"\nError: {e}")
+        exit_code = 1
     # Keep console window open when double-clicked on Windows (interactive mode)
-    if len(sys.argv) == 1:
+    if interactive_mode:
         print()
         input("Press Enter to exit...")
     raise SystemExit(exit_code)
