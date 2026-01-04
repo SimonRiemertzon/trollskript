@@ -707,16 +707,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    interactive_mode = len(sys.argv) == 1
-    try:
-        exit_code = main()
-    except Exception as e:
-        print(f"\nError: {e}")
-        exit_code = 1
-    # Keep console window open when double-clicked on Windows (interactive mode)
-    if interactive_mode:
-        print()
-        input("Press Enter to exit...")
-    raise SystemExit(exit_code)
+	interactive_mode = len(sys.argv) == 1
+
+	if interactive_mode:
+		try:
+			exit_code = main()
+		except Exception as e:
+			print(f"\nError: {e}")
+			exit_code = 1
+		# Keep console window open when double-clicked on Windows (interactive mode)
+		print()
+		input("Press Enter to exit...")
+		raise SystemExit(exit_code)
+
+	raise SystemExit(main())
 
 
