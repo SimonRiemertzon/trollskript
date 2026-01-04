@@ -317,6 +317,17 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
         install_dir = _get_exiftool_install_dir()
         existing_exe = _find_exiftool_exe(install_dir)
         if existing_exe:
+            # Rename exiftool(-k).exe to exiftool.exe if needed
+            # The (-k) version waits for keypress after running, which hangs subprocess calls
+            if "(-k)" in existing_exe.name:
+                new_path = existing_exe.with_name("exiftool.exe")
+                try:
+                    existing_exe.rename(new_path)
+                    print(f"Renamed {existing_exe.name} to exiftool.exe", flush=True)
+                    existing_exe = new_path
+                except OSError as e:
+                    print(f"Warning: Could not rename {existing_exe.name}: {e}", flush=True)
+                    print("The script may hang. Please manually rename to exiftool.exe", flush=True)
             print(f"Found ExifTool: {existing_exe}", flush=True)
             _cached_exiftool_path = str(existing_exe)
             return _cached_exiftool_path
@@ -386,7 +397,14 @@ def _run_exiftool_json(paths: list[Path], interactive: bool = False) -> list[dic
     ]
     try:
         # Separate stdout (JSON) from stderr (warnings)
-        result = subprocess.run(cmd, capture_output=True)
+        # Timeout after 120 seconds per batch to avoid hanging on problematic files
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "ExifTool timed out after 120 seconds. This may happen if:\n"
+            "  - Using 'exiftool(-k).exe' which waits for keypress (rename to 'exiftool.exe')\n"
+            "  - Processing very large or corrupted files"
+        )
     except FileNotFoundError:
         raise RuntimeError(
             "ExifTool not found. Install `exiftool` (Linux: apt install libimage-exiftool-perl) "
