@@ -19,6 +19,63 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+
+# ANSI color codes for terminal output
+class Colors:
+    """ANSI color codes - works on Windows 10+ and Linux/Mac"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    # Bright/bold colors
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    ORANGE = "\033[38;5;208m"
+
+
+def _init_colors() -> None:
+    """Enable ANSI colors on Windows."""
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass  # Fallback: colors may not work on older Windows
+
+
+def cprint(msg: str, color: str = Colors.CYAN, end: str = "\n", flush: bool = False) -> None:
+    """Print colored message."""
+    print(f"{color}{msg}{Colors.RESET}", end=end, flush=flush)
+
+
+def cprint_success(msg: str) -> None:
+    """Print success message in green."""
+    cprint(msg, Colors.GREEN)
+
+
+def cprint_warn(msg: str) -> None:
+    """Print warning message in yellow."""
+    cprint(msg, Colors.YELLOW)
+
+
+def cprint_error(msg: str) -> None:
+    """Print error message in red."""
+    cprint(msg, Colors.RED)
+
+
+def cprint_info(msg: str) -> None:
+    """Print info message in cyan."""
+    cprint(msg, Colors.CYAN)
+
+
+def cprint_header(msg: str) -> None:
+    """Print header message in bold magenta."""
+    cprint(msg, Colors.BOLD + Colors.MAGENTA)
+
+
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
 
 EXIF_DATE_TAGS_PRIORITY = [
@@ -150,25 +207,25 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
     Shows welcome message, lists removable drives, prompts user to select one.
     Returns (source_path, dest_path) or None if cancelled/no drives found.
     """
-    print("=" * 50)
-    print("  TrollSkript - Photo/Video Sorter")
-    print("=" * 50)
+    cprint("=" * 50, Colors.MAGENTA)
+    cprint("  TrollSkript - Photo/Video Sorter", Colors.BOLD + Colors.CYAN)
+    cprint("=" * 50, Colors.MAGENTA)
     print()
-    print("This tool copies photos and videos from a removable")
-    print("drive (USB/SD card) into date-based folders.")
+    cprint("This tool copies photos and videos from a removable", Colors.WHITE)
+    cprint("drive (USB/SD card) into date-based folders.", Colors.WHITE)
     print()
 
     dest = _script_dir()
-    print(f"Destination: {dest}")
+    cprint_info(f"Destination: {dest}")
     print()
 
     drives = _get_removable_drives()
     if not drives:
         print("No removable drives found!")
-        print("Please insert a USB drive or SD card and try again.")
+        cprint("Please insert a USB drive or SD card and try again.", Colors.YELLOW)
         return None
 
-    print("Available removable drives:")
+    cprint("Available removable drives:", Colors.CYAN)
     for i, (drive_path, label) in enumerate(drives, 1):
         display_label = f" ({label})" if label else ""
         print(f"  {i}. {drive_path}{display_label}")
@@ -178,7 +235,7 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
         try:
             choice = input(f"Select drive [1-{len(drives)}] or 'q' to quit: ").strip()
             if choice.lower() == "q":
-                print("Cancelled.")
+                cprint("Cancelled.", Colors.YELLOW)
                 return None
             idx = int(choice) - 1
             if 0 <= idx < len(drives):
@@ -191,17 +248,17 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
 
     # Let user select a subfolder within the drive
     print()
-    print("Now select the folder to scan for photos/videos.")
-    print("You can navigate into subfolders or select the current folder.")
+    cprint("Now select the folder to scan for photos/videos.", Colors.CYAN)
+    cprint("You can navigate into subfolders or select the current folder.", Colors.WHITE)
 
     src = _select_folder(drive_root)
     if src is None:
-        print("Cancelled.")
+        cprint("Cancelled.", Colors.YELLOW)
         return None
 
     print()
-    print(f"Source: {src}")
-    print(f"Destination: {dest}")
+    cprint_info(f"Source: {src}")
+    cprint_info(f"Destination: {dest}")
     print()
     return src, dest
 
@@ -251,7 +308,7 @@ def _find_exiftool_exe(search_dir: Path) -> Path | None:
 def _download_exiftool_windows(dest_dir: Path) -> Path:
     """Download and extract exiftool for Windows. Returns path to exiftool executable."""
     url, version = _get_exiftool_download_url()
-    print(f"Downloading ExifTool v{version} from {url}...")
+    cprint(f"Downloading ExifTool v{version} from {url}...", Colors.CYAN)
 
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
@@ -276,7 +333,7 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
     # Create destination directory if it doesn't exist
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Extracting ExifTool...")
+    cprint("Extracting ExifTool...", Colors.CYAN)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         # Extract everything to preserve DLLs and support files
         zf.extractall(dest_dir)
@@ -297,7 +354,7 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
         except OSError:
             pass  # If rename fails, we'll use the original name
 
-    print(f"ExifTool v{version} installed to: {exe_path}")
+    cprint_success(f"ExifTool v{version} installed to: {exe_path}")
     return exe_path
 
 
@@ -310,7 +367,7 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
     if _cached_exiftool_path is not None:
         return _cached_exiftool_path
 
-    print("Checking for ExifTool...", flush=True)
+    cprint("Checking for ExifTool...", Colors.CYAN, flush=True)
 
     # 1. Check common installation directory on Windows
     if sys.platform == "win32":
@@ -326,15 +383,15 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
                     print(f"Renamed {existing_exe.name} to exiftool.exe", flush=True)
                     existing_exe = new_path
                 except OSError as e:
-                    print(f"Warning: Could not rename {existing_exe.name}: {e}", flush=True)
-                    print("The script may hang. Please manually rename to exiftool.exe", flush=True)
-            print(f"Found ExifTool: {existing_exe}", flush=True)
+                    cprint(f"Warning: Could not rename {existing_exe.name}: {e}", Colors.YELLOW, flush=True)
+                    cprint("The script may hang. Please manually rename to exiftool.exe", Colors.YELLOW, flush=True)
+            cprint(f"Found ExifTool: {existing_exe}", Colors.GREEN, flush=True)
             _cached_exiftool_path = str(existing_exe)
             return _cached_exiftool_path
 
     # 2. Check if exiftool is in PATH
     if shutil.which("exiftool"):
-        print("Found ExifTool in PATH", flush=True)
+        cprint("Found ExifTool in PATH", Colors.GREEN, flush=True)
         _cached_exiftool_path = "exiftool"
         return _cached_exiftool_path
 
@@ -729,7 +786,7 @@ def copy_with_policy(
 
     # Handle collisions according to policy
     if collisions:
-        print(f"Found {len(collisions)} collision(s), applying policy: {collision_policy}")
+        cprint(f"Found {len(collisions)} collision(s), applying policy: {collision_policy}", Colors.YELLOW)
         conflicts_dir = base_out / "conflicts"
         if collision_policy == "conflicts":
             conflicts_dir.mkdir(parents=True, exist_ok=True)
@@ -835,6 +892,7 @@ Examples:
 
 
 def main() -> int:
+    _init_colors()  # Enable ANSI colors on Windows
     args = parse_args()
     if args is None:
         return 0  # User cancelled interactive mode
@@ -842,7 +900,7 @@ def main() -> int:
     # Source: command line or script directory
     src_root = args.src.resolve() if args.src else _script_dir()
     if not src_root.exists():
-        print(f"Error: Source folder does not exist: {src_root}")
+        cprint_error(f"Error: Source folder does not exist: {src_root}")
         return 1
 
     dest_root = args.dest.resolve()
@@ -856,9 +914,9 @@ def main() -> int:
     base_out.mkdir(parents=True, exist_ok=True)
     logs_dir = base_out / ".trollskript"
 
-    print(f"Source: {src_root}")
-    print(f"Destination: {base_out}")
-    print(f"Collision policy: {args.collision_policy}")
+    cprint_info(f"Source: {src_root}")
+    cprint_info(f"Destination: {base_out}")
+    cprint_info(f"Collision policy: {args.collision_policy}")
 
     # Exclude destination from scan if it's inside source
     exclude_dirs: list[Path] = []
@@ -868,12 +926,12 @@ def main() -> int:
     except Exception:
         pass
 
-    print("Scanning for media files...")
+    cprint("Scanning for media files...", Colors.CYAN)
     items = discover_media(src_root, exclude_dirs=exclude_dirs, interactive=args.interactive)
-    print(f"Found {len(items)} media file(s)")
+    cprint(f"Found {len(items)} media file(s)", Colors.GREEN)
 
     if not items:
-        print("No media files found. Exiting.")
+        cprint_warn("No media files found. Exiting.")
         return 0
 
     _write_found_list(logs_dir, items)
@@ -883,13 +941,13 @@ def main() -> int:
     if years_with_date:
         years_sorted = sorted(years_with_date)
         if len(years_sorted) > 1:
-            print(f"Note: Multiple years detected: {years_sorted}")
+            cprint(f"Note: Multiple years detected: {years_sorted}", Colors.YELLOW)
 
-    print("Indexing existing destination files for duplicate detection...")
+    cprint("Indexing existing destination files for duplicate detection...", Colors.CYAN)
     dest_index = build_dest_hash_index(base_out)
-    print(f"Indexed {len(dest_index)} existing file(s)")
+    cprint(f"Indexed {len(dest_index)} existing file(s)", Colors.GREEN)
 
-    print("Copying files (non-destructive)...")
+    cprint("Copying files (non-destructive)...", Colors.CYAN)
     copy_with_policy(
         plans=plans,
         dest_hash_index=dest_index,
@@ -898,7 +956,7 @@ def main() -> int:
         collision_policy=args.collision_policy,
     )
 
-    print(f"Done! Reports written to: {logs_dir}")
+    cprint_success(f"Done! Reports written to: {logs_dir}")
     return 0
 
 
