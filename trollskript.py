@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-__version__ = "1.0.8-dev"
+__version__ = "1.0.9-dev"
 
 
 
