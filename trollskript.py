@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+__version__ = "1.0.8-dev"
+
 
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
 
@@ -163,7 +165,7 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
     Returns (source_path, dest_path) or None if cancelled/no drives found.
     """
     print("=" * 50)
-    print("  TrollSkript - Photo/Video Sorter")
+    print(f"  TrollSkript v{__version__} - Photo/Video Sorter")
     print("=" * 50)
     print()
     print("This tool copies photos and videos from a removable")
@@ -831,6 +833,11 @@ Examples:
   python trollskript.py --dest ./output --top-folder "Vacation2024"
   python trollskript.py --dest ./output --collision-policy rename
 """,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"TrollSkript {__version__}",
     )
     parser.add_argument(
         "--src",
