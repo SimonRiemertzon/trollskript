@@ -10,6 +10,7 @@ import shutil
 import string
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -152,15 +153,17 @@ def _get_exiftool_install_dir() -> Path:
     return Path.home() / ".exiftool"
 
 
-def _get_exiftool_download_url() -> str:
-    """Fetch the latest ExifTool version and return the download URL."""
+def _get_exiftool_download_url() -> tuple[str, str]:
+    """Fetch the latest ExifTool version and return (url, version)."""
     try:
         with urllib.request.urlopen(EXIFTOOL_VER_URL, timeout=30) as resp:
             version = resp.read().decode("utf-8").strip()
-        return f"https://exiftool.org/exiftool-{version}_64.zip"
+        return f"https://exiftool.org/exiftool-{version}_64.zip", version
     except Exception:
         # Fallback to a known version if we can't fetch the latest
-        return "https://exiftool.org/exiftool-13.45_64.zip"
+        # This version should be updated periodically to match a recent release
+        fallback_version = "13.45"
+        return f"https://exiftool.org/exiftool-{fallback_version}_64.zip", fallback_version
 
 
 def _find_exiftool_exe(search_dir: Path) -> Path | None:
@@ -176,11 +179,26 @@ def _find_exiftool_exe(search_dir: Path) -> Path | None:
 
 def _download_exiftool_windows(dest_dir: Path) -> Path:
     """Download and extract exiftool for Windows. Returns path to exiftool executable."""
-    url = _get_exiftool_download_url()
-    print(f"Downloading ExifTool from {url}...")
+    url, version = _get_exiftool_download_url()
+    print(f"Downloading ExifTool v{version} from {url}...")
+
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
             data = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                f"ExifTool v{version} not found on server (404). "
+                f"The version may have been removed from exiftool.org. "
+                f"Please download ExifTool manually from https://exiftool.org/ "
+                f"and place exiftool.exe in: {dest_dir}"
+            )
+        raise RuntimeError(f"Failed to download ExifTool: HTTP Error {e.code}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Network error downloading ExifTool: {e.reason}. "
+            f"Please check your internet connection or download manually from https://exiftool.org/"
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to download ExifTool: {e}")
 
@@ -197,7 +215,7 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
     if exe_path is None:
         raise RuntimeError("No ExifTool executable found after extraction")
 
-    print(f"ExifTool installed to: {exe_path}")
+    print(f"ExifTool v{version} installed to: {exe_path}")
     return exe_path
 
 
