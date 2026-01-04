@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import string
+import logging
 import subprocess
 import sys
 import urllib.error
@@ -17,6 +18,71 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+
+
+# Configure logging
+# Debug logs go to file, user messages go to console via print()
+_log_file: Path | None = None
+
+
+def _setup_logging(dest_root: Path | None = None) -> logging.Logger:
+    """
+    Set up logging with file handler for debug info.
+    Call this early in main() with the destination path.
+    """
+    global _log_file
+    
+    logger = logging.getLogger("trollskript")
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # Console handler for warnings and errors only
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(console_handler)
+    
+    # File handler for debug logs (if dest_root provided)
+    if dest_root:
+        logs_dir = dest_root / ".trollskript"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        _log_file = logs_dir / "debug.log"
+        file_handler = logging.FileHandler(_log_file, mode="w", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(file_handler)
+    
+    return logger
+
+
+def _get_logger() -> logging.Logger:
+    """Get the trollskript logger."""
+    return logging.getLogger("trollskript")
+
+
+def log_debug(msg: str) -> None:
+    """Log debug message (goes to file only)."""
+    _get_logger().debug(msg)
+
+
+def log_info(msg: str) -> None:
+    """Log info message (goes to file only)."""
+    _get_logger().info(msg)
+
+
+def log_warning(msg: str) -> None:
+    """Log warning message (goes to file and console)."""
+    _get_logger().warning(msg)
+
+
+def log_error(msg: str) -> None:
+    """Log error message (goes to file and console)."""
+    _get_logger().error(msg)
 
 
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
@@ -379,6 +445,8 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
 def _run_exiftool_json(paths: list[Path], interactive: bool = False) -> list[dict[str, Any]]:
     if not paths:
         return []
+    
+    log_debug(f"_run_exiftool_json: processing {len(paths)} files")
 
     cmd = [
         _exiftool_path(interactive=interactive),
@@ -400,6 +468,7 @@ def _run_exiftool_json(paths: list[Path], interactive: bool = False) -> list[dic
         # Timeout after 120 seconds per batch to avoid hanging on problematic files
         result = subprocess.run(cmd, capture_output=True, timeout=120)
     except subprocess.TimeoutExpired:
+        log_error(f"ExifTool timed out processing {len(paths)} files")
         raise RuntimeError(
             "ExifTool timed out after 120 seconds. This may happen if:\n"
             "  - Using 'exiftool(-k).exe' which waits for keypress (rename to 'exiftool.exe')\n"
@@ -507,8 +576,11 @@ def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
 
 
 def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interactive: bool = False) -> list[MediaItem]:
+    log_debug(f"discover_media: starting scan of {root}")
+    log_debug(f"discover_media: exclude_dirs={exclude_dirs}")
     print("  Walking directory tree...", flush=True)
     all_files = _walk_files_excluding(root, exclude_dirs or [])
+    log_debug(f"discover_media: found {len(all_files)} total files")
     print(f"  Found {len(all_files)} files to analyze", flush=True)
     items: list[MediaItem] = []
 
@@ -537,6 +609,7 @@ def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interacti
                 )
             )
     print()  # newline after progress indicator
+    log_info(f"discover_media: found {len(items)} media files")
     return items
 
 
@@ -579,8 +652,10 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
     """
     Returns hash -> [paths...] for files already present in destination.
     """
+    log_debug(f"build_dest_hash_index: scanning {dest_root}")
     idx: dict[str, list[str]] = {}
     if not dest_root.exists():
+        log_debug("build_dest_hash_index: dest_root does not exist, returning empty index")
         return idx
 
     skip_names = {
@@ -601,6 +676,7 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
         except OSError:
             continue
         idx.setdefault(hx, []).append(str(p))
+    log_info(f"build_dest_hash_index: indexed {len(idx)} unique hashes")
     return idx
 
 
@@ -855,6 +931,13 @@ def main() -> int:
 
     base_out.mkdir(parents=True, exist_ok=True)
     logs_dir = base_out / ".trollskript"
+    
+    # Set up logging to debug.log in the output folder
+    _setup_logging(base_out)
+    log_info(f"TrollSkript started")
+    log_info(f"Source: {src_root}")
+    log_info(f"Destination: {base_out}")
+    log_info(f"Collision policy: {args.collision_policy}")
 
     print(f"Source: {src_root}")
     print(f"Destination: {base_out}")
