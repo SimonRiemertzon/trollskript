@@ -21,6 +21,43 @@ from typing import Any, Iterable
 __version__ = "1.0.8-dev"
 
 
+
+# ANSI color codes for terminal output
+class Colors:
+    """ANSI color codes - works on Windows 10+ and Linux/Mac"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    # Bright/bold colors
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    ORANGE = "\033[38;5;208m"
+
+
+def _print_bam_banner() -> None:
+    """Print colorful BAM ASCII art explosion."""
+    # Enable ANSI colors on Windows
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    
+    C = Colors
+    explosion = [
+        f"{C.YELLOW}        *  {C.ORANGE}.  *  {C.RED}. *{C.RESET}",
+        f"{C.ORANGE}    *  {C.RED}\\  | {C.YELLOW}//{C.ORANGE}  *{C.RESET}",
+        f"{C.RED}  *  -- {C.BOLD}{C.YELLOW}B A M{C.RESET}{C.RED} --  *{C.RESET}",
+        f"{C.ORANGE}    *  {C.RED}//  | {C.YELLOW}\\\\{C.ORANGE}  *{C.RESET}",
+        f"{C.YELLOW}        *  {C.ORANGE}.  *  {C.RED}. *{C.RESET}",
+    ]
+    for line in explosion:
+        print(line)
+    print()
+
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
 
 # Common media file extensions for duplicate detection in destination
@@ -164,6 +201,7 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
     Shows welcome message, lists removable drives, prompts user to select one.
     Returns (source_path, dest_path) or None if cancelled/no drives found.
     """
+    _print_bam_banner()
     print("=" * 50)
     print(f"  TrollSkript v{__version__} - Photo/Video Sorter")
     print("=" * 50)
