@@ -85,6 +85,65 @@ def _get_removable_drives() -> list[tuple[str, str]]:
     return drives
 
 
+def _get_subfolders(folder: Path) -> list[Path]:
+    """Get list of subfolders in a directory."""
+    try:
+        return sorted([p for p in folder.iterdir() if p.is_dir()])
+    except (PermissionError, FileNotFoundError, OSError):
+        return []
+
+
+def _select_folder(start_path: Path) -> Path | None:
+    """
+    Interactive folder browser. Lets user navigate into subfolders or select current folder.
+    Returns selected path or None if cancelled.
+    """
+    current = start_path
+
+    while True:
+        print()
+        print(f"Current folder: {current}")
+        subfolders = _get_subfolders(current)
+
+        print("  0. [SELECT THIS FOLDER]")
+        if current != start_path:
+            print("  b. [GO BACK]")
+
+        if subfolders:
+            print()
+            print("Subfolders:")
+            for i, folder in enumerate(subfolders, 1):
+                print(f"  {i}. {folder.name}/")
+        else:
+            print("  (no subfolders)")
+        print()
+
+        max_choice = len(subfolders)
+        prompt = f"Select [0-{max_choice}]"
+        if current != start_path:
+            prompt += ", 'b' to go back"
+        prompt += ", or 'q' to quit: "
+
+        choice = input(prompt).strip().lower()
+
+        if choice == "q":
+            return None
+        if choice == "b" and current != start_path:
+            current = current.parent
+            continue
+        if choice == "0":
+            return current
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(subfolders):
+                current = subfolders[idx]
+            else:
+                print(f"Please enter a number between 0 and {max_choice}")
+        except ValueError:
+            print("Invalid input. Please enter a number or 'q' to quit.")
+
+
 def _run_interactive_mode() -> tuple[Path, Path] | None:
     """
     Interactive mode for Windows double-click usage.
@@ -123,16 +182,28 @@ def _run_interactive_mode() -> tuple[Path, Path] | None:
                 return None
             idx = int(choice) - 1
             if 0 <= idx < len(drives):
-                src = Path(drives[idx][0])
-                print()
-                print(f"Source: {src}")
-                print(f"Destination: {dest}")
-                print()
-                return src, dest
+                drive_root = Path(drives[idx][0])
+                break
             else:
                 print(f"Please enter a number between 1 and {len(drives)}")
         except ValueError:
             print(f"Please enter a number between 1 and {len(drives)} or 'q' to quit")
+
+    # Let user select a subfolder within the drive
+    print()
+    print("Now select the folder to scan for photos/videos.")
+    print("You can navigate into subfolders or select the current folder.")
+
+    src = _select_folder(drive_root)
+    if src is None:
+        print("Cancelled.")
+        return None
+
+    print()
+    print(f"Source: {src}")
+    print(f"Destination: {dest}")
+    print()
+    return src, dest
 
 
 def _write_json(path: Path, obj: Any) -> None:
@@ -221,25 +292,28 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
 
 def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str:
     """Get path to exiftool. On Windows, prompts user to install if not found."""
+    print("Checking for ExifTool...", flush=True)
+
     # 1. Check common installation directory on Windows
     if sys.platform == "win32":
         install_dir = _get_exiftool_install_dir()
         existing_exe = _find_exiftool_exe(install_dir)
         if existing_exe:
+            print(f"Found ExifTool: {existing_exe}", flush=True)
             return str(existing_exe)
 
     # 2. Check if exiftool is in PATH
-    import shutil
     if shutil.which("exiftool"):
+        print("Found ExifTool in PATH", flush=True)
         return "exiftool"
 
     # 3. ExifTool not found - on Windows, offer to install
     if sys.platform == "win32" and auto_download:
         install_dir = _get_exiftool_install_dir()
-        print("\n" + "=" * 60)
-        print("ExifTool is required but not installed.")
-        print(f"Install location: {install_dir}")
-        print("=" * 60)
+        print("\n" + "=" * 60, flush=True)
+        print("ExifTool is required but not installed.", flush=True)
+        print(f"Install location: {install_dir}", flush=True)
+        print("=" * 60, flush=True)
 
         if interactive:
             response = input("\nWould you like to install ExifTool now? [Y/n]: ").strip().lower()
@@ -393,10 +467,14 @@ def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
 
 
 def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interactive: bool = False) -> list[MediaItem]:
+    print("  Walking directory tree...", flush=True)
     all_files = _walk_files_excluding(root, exclude_dirs or [])
+    print(f"  Found {len(all_files)} files to analyze", flush=True)
     items: list[MediaItem] = []
 
-    for batch in _batched(all_files, 200):
+    total_batches = (len(all_files) + 199) // 200  # ceiling division
+    for batch_num, batch in enumerate(_batched(all_files, 200), 1):
+        print(f"  Processing batch {batch_num}/{total_batches}...", end="\r", flush=True)
         metas = _run_exiftool_json(batch, interactive=interactive)
         for meta in metas:
             directory = meta.get("Directory")
@@ -418,6 +496,7 @@ def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interacti
                     mime_type=mime,
                 )
             )
+    print()  # newline after progress indicator
     return items
 
 
