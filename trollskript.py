@@ -776,16 +776,22 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
         "collisions.json",
         "collisions_applied.json",
     }
-    
-    # First collect all media files (fast)
-    all_files = _walk_files(dest_root)
-    media_files = [
-        p for p in all_files
-        if p.suffix.lower() in MEDIA_EXTENSIONS
-        and p.name not in skip_names
-        and p.is_file()
-    ]
-    
+
+    # Walk and filter in one pass for better performance on large directories
+    print("  Scanning destination folder...", end="", flush=True)
+    media_files: list[Path] = []
+    file_count = 0
+    for dirpath, _dirnames, filenames in os.walk(dest_root):
+        for fn in filenames:
+            file_count += 1
+            if file_count % 500 == 0:
+                print(f"\r  Scanning destination folder... ({file_count} files checked)", end="", flush=True)
+            p = Path(dirpath) / fn
+            if p.suffix.lower() in MEDIA_EXTENSIONS and fn not in skip_names:
+                media_files.append(p)
+    print(f"\r  Scanning destination folder... done ({file_count} files, {len(media_files)} media)", flush=True)
+    log_debug(f"build_dest_hash_index: scanned {file_count} files, found {len(media_files)} media files")
+
     if not media_files:
         return idx
     
