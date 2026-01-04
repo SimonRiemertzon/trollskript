@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-__version__ = "1.0.9-dev"
+__version__ = "1.0.10-dev"
 
 
 
@@ -997,6 +997,7 @@ def parse_args() -> argparse.Namespace | None:
             dest=dest,
             top_folder=None,
             collision_policy="skip",
+            skip_duplicates=True,
             interactive=True,
         )
 
@@ -1040,6 +1041,18 @@ Examples:
         choices=["skip", "rename", "conflicts"],
         default="skip",
         help="How to handle filename collisions: skip (default), rename (add suffix), conflicts (copy to conflicts/)",
+    )
+    parser.add_argument(
+        "--skip-duplicates",
+        action="store_true",
+        default=True,
+        help="Skip scanning destination folder for duplicates (default: enabled, use --no-skip-duplicates to enable duplicate detection)",
+    )
+    parser.add_argument(
+        "--no-skip-duplicates",
+        action="store_false",
+        dest="skip_duplicates",
+        help="Enable duplicate detection by scanning destination folder (can be slow for large folders)",
     )
     args = parser.parse_args()
     args.interactive = False  # CLI mode is not interactive
@@ -1105,9 +1118,14 @@ def main() -> int:
         if len(years_sorted) > 1:
             cprint(f"Note: Multiple years detected: {years_sorted}", Colors.YELLOW)
 
-    cprint("Indexing existing destination files for duplicate detection...", Colors.CYAN)
-    dest_index = build_dest_hash_index(base_out)
-    cprint(f"Indexed {len(dest_index)} existing file(s)", Colors.GREEN)
+    # Duplicate detection (skip by default for performance on large dest folders)
+    if args.skip_duplicates:
+        dest_index: dict[str, list[str]] = {}
+        log_info("Skipping duplicate detection (--skip-duplicates is enabled)")
+    else:
+        cprint("Indexing existing destination files for duplicate detection...", Colors.CYAN)
+        dest_index = build_dest_hash_index(base_out)
+        cprint(f"Indexed {len(dest_index)} existing file(s)", Colors.GREEN)
 
     cprint("Copying files (non-destructive)...", Colors.CYAN)
     copy_with_policy(
