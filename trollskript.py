@@ -238,12 +238,12 @@ def _get_exiftool_download_url() -> tuple[str, str]:
 
 
 def _find_exiftool_exe(search_dir: Path) -> Path | None:
-    """Search for ExifTool executable under search_dir. Prefers exiftool(-k).exe."""
-    # Look for exiftool(-k).exe first (the default name in the ZIP)
-    for exe in search_dir.rglob("exiftool(-k).exe"):
-        return exe
-    # Fallback to exiftool.exe
+    """Search for ExifTool executable under search_dir. Prefers exiftool.exe over exiftool(-k).exe."""
+    # Look for exiftool.exe first (the renamed version that doesn't wait for keypress)
     for exe in search_dir.rglob("exiftool.exe"):
+        return exe
+    # Fallback to exiftool(-k).exe (the default name in the ZIP, but waits for keypress)
+    for exe in search_dir.rglob("exiftool(-k).exe"):
         return exe
     return None
 
@@ -286,12 +286,30 @@ def _download_exiftool_windows(dest_dir: Path) -> Path:
     if exe_path is None:
         raise RuntimeError("No ExifTool executable found after extraction")
 
+    # Rename exiftool(-k).exe to exiftool.exe if needed
+    # The (-k) version waits for keypress after running, which hangs subprocess calls
+    if "(-k)" in exe_path.name:
+        new_path = exe_path.with_name("exiftool.exe")
+        try:
+            exe_path.rename(new_path)
+            exe_path = new_path
+            print("Renamed exiftool(-k).exe to exiftool.exe")
+        except OSError:
+            pass  # If rename fails, we'll use the original name
+
     print(f"ExifTool v{version} installed to: {exe_path}")
     return exe_path
 
 
+_cached_exiftool_path: str | None = None
+
+
 def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str:
     """Get path to exiftool. On Windows, prompts user to install if not found."""
+    global _cached_exiftool_path
+    if _cached_exiftool_path is not None:
+        return _cached_exiftool_path
+
     print("Checking for ExifTool...", flush=True)
 
     # 1. Check common installation directory on Windows
@@ -300,12 +318,14 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
         existing_exe = _find_exiftool_exe(install_dir)
         if existing_exe:
             print(f"Found ExifTool: {existing_exe}", flush=True)
-            return str(existing_exe)
+            _cached_exiftool_path = str(existing_exe)
+            return _cached_exiftool_path
 
     # 2. Check if exiftool is in PATH
     if shutil.which("exiftool"):
         print("Found ExifTool in PATH", flush=True)
-        return "exiftool"
+        _cached_exiftool_path = "exiftool"
+        return _cached_exiftool_path
 
     # 3. ExifTool not found - on Windows, offer to install
     if sys.platform == "win32" and auto_download:
@@ -320,7 +340,8 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
             if response in ("", "y", "yes", "ja", "j"):
                 try:
                     exe_path = _download_exiftool_windows(install_dir)
-                    return str(exe_path)
+                    _cached_exiftool_path = str(exe_path)
+                    return _cached_exiftool_path
                 except Exception as e:
                     raise RuntimeError(f"Failed to install ExifTool: {e}")
             else:
@@ -332,7 +353,8 @@ def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str
             # Non-interactive mode: auto-install without prompting
             try:
                 exe_path = _download_exiftool_windows(install_dir)
-                return str(exe_path)
+                _cached_exiftool_path = str(exe_path)
+                return _cached_exiftool_path
             except Exception as e:
                 raise RuntimeError(f"Failed to auto-install ExifTool: {e}")
 
