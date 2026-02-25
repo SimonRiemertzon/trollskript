@@ -3,20 +3,18 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
-import io
 import json
 import os
 import shutil
 import string
 import subprocess
 import sys
-import urllib.error
-import urllib.request
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+from install import ensure_exiftool
 
 
 SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
@@ -66,23 +64,43 @@ def _get_volume_label(drive: str) -> str:
 
 def _get_removable_drives() -> list[tuple[str, str]]:
     """
-    Detect removable drives on Windows (USB drives, SD cards).
+    Detect removable drives (USB drives, SD cards).
     Returns list of (drive_path, volume_label) tuples.
     """
-    if sys.platform != "win32":
-        return []
-    drives = []
-    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-    for letter in string.ascii_uppercase:
-        if bitmask & 1:
-            drive = f"{letter}:\\"
-            drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
-            # DriveType 2 = DRIVE_REMOVABLE
-            if drive_type == 2:
-                label = _get_volume_label(drive)
-                drives.append((drive, label))
-        bitmask >>= 1
-    return drives
+    if sys.platform == "win32":
+        drives = []
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for letter in string.ascii_uppercase:
+            if bitmask & 1:
+                drive = f"{letter}:\\"
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+                # DriveType 2 = DRIVE_REMOVABLE
+                if drive_type == 2:
+                    label = _get_volume_label(drive)
+                    drives.append((drive, label))
+            bitmask >>= 1
+        return drives
+    else:
+        # Linux/macOS: use lsblk to find only removable block devices (USB, SD cards)
+        drives = []
+        try:
+            result = subprocess.run(
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,LABEL"],
+                capture_output=True, text=True, check=True,
+            )
+            data = json.loads(result.stdout)
+
+            def _walk(devices: list) -> None:
+                for dev in devices:
+                    if dev.get("rm") and dev.get("mountpoint"):
+                        label = dev.get("label") or dev["name"]
+                        drives.append((dev["mountpoint"] + "/", label))
+                    _walk(dev.get("children") or [])
+
+            _walk(data.get("blockdevices", []))
+        except (FileNotFoundError, subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
+            pass
+        return drives
 
 
 def _run_interactive_mode() -> tuple[Path, Path] | None:
@@ -139,142 +157,12 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-EXIFTOOL_VER_URL = "https://exiftool.org/ver.txt"
-EXIFTOOL_INSTALL_DIR_NAME = "exiftool"
-
-
-def _get_exiftool_install_dir() -> Path:
-    """Get the common installation directory for ExifTool on Windows."""
-    # Use %LOCALAPPDATA%\exiftool (e.g., C:\Users\<user>\AppData\Local\exiftool)
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / EXIFTOOL_INSTALL_DIR_NAME
-    # Fallback to user home directory
-    return Path.home() / ".exiftool"
-
-
-def _get_exiftool_download_url() -> tuple[str, str]:
-    """Fetch the latest ExifTool version and return (url, version)."""
-    try:
-        with urllib.request.urlopen(EXIFTOOL_VER_URL, timeout=30) as resp:
-            version = resp.read().decode("utf-8").strip()
-        return f"https://exiftool.org/exiftool-{version}_64.zip", version
-    except Exception:
-        # Fallback to a known version if we can't fetch the latest
-        # This version should be updated periodically to match a recent release
-        fallback_version = "13.45"
-        return f"https://exiftool.org/exiftool-{fallback_version}_64.zip", fallback_version
-
-
-def _find_exiftool_exe(search_dir: Path) -> Path | None:
-    """Search for ExifTool executable under search_dir. Prefers exiftool(-k).exe."""
-    # Look for exiftool(-k).exe first (the default name in the ZIP)
-    for exe in search_dir.rglob("exiftool(-k).exe"):
-        return exe
-    # Fallback to exiftool.exe
-    for exe in search_dir.rglob("exiftool.exe"):
-        return exe
-    return None
-
-
-def _download_exiftool_windows(dest_dir: Path) -> Path:
-    """Download and extract exiftool for Windows. Returns path to exiftool executable."""
-    url, version = _get_exiftool_download_url()
-    print(f"Downloading ExifTool v{version} from {url}...")
-
-    try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise RuntimeError(
-                f"ExifTool v{version} not found on server (404). "
-                f"The version may have been removed from exiftool.org. "
-                f"Please download ExifTool manually from https://exiftool.org/ "
-                f"and place exiftool.exe in: {dest_dir}"
-            )
-        raise RuntimeError(f"Failed to download ExifTool: HTTP Error {e.code}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"Network error downloading ExifTool: {e.reason}. "
-            f"Please check your internet connection or download manually from https://exiftool.org/"
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to download ExifTool: {e}")
-
-    # Create destination directory if it doesn't exist
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Extracting ExifTool...")
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        # Extract everything to preserve DLLs and support files
-        zf.extractall(dest_dir)
-
-    # Find the extracted executable
-    exe_path = _find_exiftool_exe(dest_dir)
-    if exe_path is None:
-        raise RuntimeError("No ExifTool executable found after extraction")
-
-    print(f"ExifTool v{version} installed to: {exe_path}")
-    return exe_path
-
-
-def _exiftool_path(auto_download: bool = True, interactive: bool = False) -> str:
-    """Get path to exiftool. On Windows, prompts user to install if not found."""
-    # 1. Check common installation directory on Windows
-    if sys.platform == "win32":
-        install_dir = _get_exiftool_install_dir()
-        existing_exe = _find_exiftool_exe(install_dir)
-        if existing_exe:
-            return str(existing_exe)
-
-    # 2. Check if exiftool is in PATH
-    import shutil
-    if shutil.which("exiftool"):
-        return "exiftool"
-
-    # 3. ExifTool not found - on Windows, offer to install
-    if sys.platform == "win32" and auto_download:
-        install_dir = _get_exiftool_install_dir()
-        print("\n" + "=" * 60)
-        print("ExifTool is required but not installed.")
-        print(f"Install location: {install_dir}")
-        print("=" * 60)
-
-        if interactive:
-            response = input("\nWould you like to install ExifTool now? [Y/n]: ").strip().lower()
-            if response in ("", "y", "yes", "ja", "j"):
-                try:
-                    exe_path = _download_exiftool_windows(install_dir)
-                    return str(exe_path)
-                except Exception as e:
-                    raise RuntimeError(f"Failed to install ExifTool: {e}")
-            else:
-                raise RuntimeError(
-                    "ExifTool is required to run this script. "
-                    "Please install it manually or re-run and accept the installation."
-                )
-        else:
-            # Non-interactive mode: auto-install without prompting
-            try:
-                exe_path = _download_exiftool_windows(install_dir)
-                return str(exe_path)
-            except Exception as e:
-                raise RuntimeError(f"Failed to auto-install ExifTool: {e}")
-
-    # 4. Not on Windows and not in PATH
-    raise RuntimeError(
-        "ExifTool is required but not found. "
-        "Please install it: https://exiftool.org/"
-    )
-
-
-def _run_exiftool_json(paths: list[Path], interactive: bool = False) -> list[dict[str, Any]]:
+def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
     if not paths:
         return []
 
     cmd = [
-        _exiftool_path(interactive=interactive),
+        ensure_exiftool(),
         "-json",
         "-api",
         "largefilesupport=1",
@@ -392,12 +280,12 @@ def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
         yield it[i : i + n]
 
 
-def discover_media(root: Path, exclude_dirs: list[Path] | None = None, interactive: bool = False) -> list[MediaItem]:
+def discover_media(root: Path, exclude_dirs: list[Path] | None = None) -> list[MediaItem]:
     all_files = _walk_files_excluding(root, exclude_dirs or [])
     items: list[MediaItem] = []
 
     for batch in _batched(all_files, 200):
-        metas = _run_exiftool_json(batch, interactive=interactive)
+        metas = _run_exiftool_json(batch)
         for meta in metas:
             directory = meta.get("Directory")
             filename = meta.get("FileName")
@@ -750,7 +638,7 @@ def main() -> int:
         pass
 
     print("Scanning for media files...")
-    items = discover_media(src_root, exclude_dirs=exclude_dirs, interactive=args.interactive)
+    items = discover_media(src_root, exclude_dirs=exclude_dirs)
     print(f"Found {len(items)} media file(s)")
 
     if not items:
