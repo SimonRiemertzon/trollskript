@@ -443,15 +443,15 @@ def copy_with_policy(
     dest_hash_index: dict[str, list[str]],
     base_out: Path,
     logs_dir: Path,
-    collision_policy: str = "skip",
+    collision_policy: str = "rename",
 ) -> None:
     """
     Copy files according to plan, handling duplicates and collisions.
 
-    collision_policy: "skip" | "rename" | "conflicts"
+    collision_policy: "skip" | "rename" | "collisions"
         - skip: don't copy files that would overwrite different content
         - rename: add suffix like _(1) to avoid collision
-        - conflicts: copy collisions to a separate conflicts/ folder
+        - collisions: copy collisions to a separate collisions/ folder
     """
     report: list[dict[str, Any]] = []
     duplicates: list[dict[str, Any]] = []
@@ -501,9 +501,9 @@ def copy_with_policy(
     # Handle collisions according to policy
     if collisions:
         print(f"Found {len(collisions)} collision(s), applying policy: {collision_policy}")
-        conflicts_dir = base_out / "conflicts"
-        if collision_policy == "conflicts":
-            conflicts_dir.mkdir(parents=True, exist_ok=True)
+        collisions_dir = base_out / "collisions"
+        if collision_policy == "collisions":
+            collisions_dir.mkdir(parents=True, exist_ok=True)
 
         # Track media file renames so sidecars can follow: group_id -> (old_stem, new_stem, new_parent)
         media_renames: dict[str, tuple[str, str, Path]] = {}
@@ -535,7 +535,7 @@ def copy_with_policy(
             elif collision_policy == "rename":
                 final_dst = _ensure_unique_path(dst)
             else:
-                final_dst = _ensure_unique_path(conflicts_dir / dst.name)
+                final_dst = _ensure_unique_path(collisions_dir / dst.name)
 
             # Track media file renames for sidecars to follow
             if kind == "media" and final_dst.stem != dst.stem:
@@ -560,7 +560,7 @@ def parse_args() -> argparse.Namespace | None:
             src=src,
             dest=dest,
             top_folder=None,
-            collision_policy="skip",
+            collision_policy="rename",
             interactive=True,
         )
 
@@ -572,7 +572,7 @@ Examples:
   python trollskript.py --dest /path/to/sorted
   python trollskript.py --src /photos/unsorted --dest /photos/sorted
   python trollskript.py --dest ./output --top-folder "Vacation2024"
-  python trollskript.py --dest ./output --collision-policy rename
+  python trollskript.py --dest ./output --collision-policy collisions
 """,
     )
     parser.add_argument(
@@ -596,9 +596,9 @@ Examples:
     parser.add_argument(
         "--collision-policy",
         type=str,
-        choices=["skip", "rename", "conflicts"],
-        default="skip",
-        help="How to handle filename collisions: skip (default), rename (add suffix), conflicts (copy to conflicts/)",
+        choices=["skip", "rename", "collisions"],
+        default="rename",
+        help="How to handle filename collisions: rename (default, add suffix), skip, collisions (copy to collisions/)",
     )
     args = parser.parse_args()
     args.interactive = False  # CLI mode is not interactive
