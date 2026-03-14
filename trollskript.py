@@ -85,14 +85,15 @@ def _get_removable_drives() -> list[tuple[str, str]]:
         drives = []
         try:
             result = subprocess.run(
-                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,LABEL"],
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,HOTPLUG,LABEL"],
                 capture_output=True, text=True, check=True,
             )
             data = json.loads(result.stdout)
 
             def _walk(devices: list) -> None:
                 for dev in devices:
-                    if dev.get("rm") and dev.get("mountpoint"):
+                    is_removable = dev.get("rm") or dev.get("hotplug")
+                    if is_removable and dev.get("mountpoint"):
                         label = dev.get("label") or dev["name"]
                         drives.append((dev["mountpoint"] + "/", label))
                     _walk(dev.get("children") or [])
@@ -185,8 +186,9 @@ def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
             "or place `exiftool.exe` next to this script (Windows)."
         )
 
-    # Fail fast if exiftool returned an error
-    if result.returncode != 0:
+    # Exit code 1 = minor errors (some files unreadable) but output is still valid.
+    # Exit code 2+ = fatal error.
+    if result.returncode >= 2:
         stderr_msg = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"ExifTool failed (exit code {result.returncode}): {stderr_msg}")
 
@@ -237,7 +239,7 @@ def _pick_best_date(meta: dict[str, Any]) -> tuple[datetime | None, str | None]:
 def _is_media_mime(mime: str | None) -> bool:
     if not mime:
         return False
-    return mime.startswith("image/") or mime.startswith("video/")
+    return mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")
 
 
 def _find_sidecars_for(src: Path) -> tuple[Path, ...]:

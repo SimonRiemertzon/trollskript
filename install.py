@@ -63,9 +63,52 @@ def download_and_install(dest_dir: Path) -> Path:
     return exe
 
 
+def _detect_package_manager() -> tuple[str, list[str]] | None:
+    """
+    Detect the system package manager and return (name, install_command).
+    Returns None if none found.
+    """
+    import shutil as _shutil
+
+    candidates = [
+        ("apt-get", ["sudo", "apt-get", "install", "-y", "libimage-exiftool-perl"]),
+        ("dnf",     ["sudo", "dnf",     "install", "-y", "perl-Image-ExifTool"]),
+        ("pacman",  ["sudo", "pacman",  "-S", "--noconfirm", "perl-image-exiftool"]),
+        ("zypper",  ["sudo", "zypper",  "install", "-y", "perl-Image-ExifTool"]),
+        ("brew",    ["brew", "install", "exiftool"]),
+    ]
+    for name, cmd in candidates:
+        if _shutil.which(name):
+            return name, cmd
+    return None
+
+
+def _install_exiftool_unix() -> None:
+    """Prompt the user and install ExifTool via the system package manager."""
+    result = _detect_package_manager()
+    if result is None:
+        raise RuntimeError(
+            "ExifTool is required but not found, and no supported package manager "
+            "was detected.\nInstall it manually: https://exiftool.org/"
+        )
+
+    pm_name, cmd = result
+    print("\nExifTool is required to read photo/video metadata.")
+    print(f"It will be installed using: {' '.join(cmd)}")
+    response = input("Would you like to install ExifTool now? [Y/n]: ").strip().lower()
+    if response not in ("", "y", "yes"):
+        raise RuntimeError("ExifTool is required. Exiting.")
+
+    import subprocess as _subprocess
+    ret = _subprocess.call(cmd)
+    if ret != 0:
+        raise RuntimeError(f"Installation failed (exit code {ret}). Try running manually:\n  {' '.join(cmd)}")
+    print("ExifTool installed successfully.")
+
+
 def ensure_exiftool() -> str:
     """
-    Return path to exiftool. On Windows, prompt to install if missing.
+    Return path to exiftool. Prompts to install if missing, on any platform.
     Raises RuntimeError if not available.
     """
     import shutil as _shutil
@@ -80,20 +123,20 @@ def ensure_exiftool() -> str:
     if _shutil.which("exiftool"):
         return "exiftool"
 
-    if sys.platform != "win32":
-        raise RuntimeError(
-            "ExifTool is required but not found.\n"
-            "Install it: https://exiftool.org/"
-        )
+    if sys.platform == "win32":
+        # Windows: prompt and auto-download
+        print("\nExifTool is required to read photo/video metadata.")
+        print(f"It will be installed to: {get_install_dir()}")
+        response = input("Would you like to install ExifTool now? [Y/n]: ").strip().lower()
+        if response not in ("", "y", "yes"):
+            raise RuntimeError("ExifTool is required. Exiting.")
+        return str(download_and_install(get_install_dir()))
 
-    # Windows: prompt user
-    print("\nExifTool is required to read photo/video metadata.")
-    print(f"It will be installed to: {get_install_dir()}")
-    response = input("Would you like to install ExifTool now? [Y/n]: ").strip().lower()
-    if response not in ("", "y", "yes"):
-        raise RuntimeError("ExifTool is required. Exiting.")
-
-    return str(download_and_install(get_install_dir()))
+    # Linux/macOS: prompt and install via package manager
+    _install_exiftool_unix()
+    if _shutil.which("exiftool"):
+        return "exiftool"
+    raise RuntimeError("ExifTool still not found after installation. Try opening a new terminal.")
 
 
 if __name__ == "__main__":
