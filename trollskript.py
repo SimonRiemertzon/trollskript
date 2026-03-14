@@ -27,6 +27,24 @@ EXIF_DATE_TAGS_PRIORITY = [
     "ModifyDate",
 ]
 
+# Known media file extensions — used to pre-filter before calling ExifTool.
+# This avoids scanning system files, text files, databases, etc.
+MEDIA_EXTS = {
+    # Images (common + RAW)
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif",
+    ".avif", ".jxl", ".ico", ".svg",
+    # RAW formats
+    ".nef", ".cr2", ".cr3", ".arw", ".orf", ".rw2", ".raf", ".dng", ".pef", ".srw",
+    ".x3f", ".3fr", ".ari", ".bay", ".cap", ".crw", ".dcr", ".erf", ".fff", ".iiq",
+    ".k25", ".kdc", ".mef", ".mos", ".mrw", ".nrw", ".ptx", ".r3d", ".raw", ".rwl",
+    ".rwz", ".sr2", ".srf",
+    # Video
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
+    ".3gp", ".3g2", ".mts", ".m2ts", ".ts", ".vob", ".ogv", ".divx", ".asf",
+    # Audio
+    ".wav", ".mp3", ".aac", ".flac", ".ogg", ".wma", ".m4a", ".aiff", ".aif", ".opus",
+}
+
 
 @dataclass(frozen=True)
 class MediaItem:
@@ -282,32 +300,117 @@ def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
         yield it[i : i + n]
 
 
-def discover_media(root: Path, exclude_dirs: list[Path] | None = None) -> list[MediaItem]:
-    all_files = _walk_files_excluding(root, exclude_dirs or [])
-    items: list[MediaItem] = []
+def _load_scan_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
+    """Load cached scan results. Returns {src_path -> cache_entry}."""
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        return {entry["src"]: entry for entry in data if isinstance(entry, dict) and "src" in entry}
+    except (json.JSONDecodeError, OSError, KeyError):
+        return {}
 
-    for batch in _batched(all_files, 200):
-        metas = _run_exiftool_json(batch)
-        for meta in metas:
-            directory = meta.get("Directory")
-            filename = meta.get("FileName")
-            if not isinstance(directory, str) or not isinstance(filename, str) or not directory or not filename:
+
+def _save_scan_cache(cache_path: Path, items: list[MediaItem]) -> None:
+    """Save scan results to cache, including file size and mtime for cache validation."""
+    entries = []
+    for item in items:
+        try:
+            st = item.src.stat()
+        except OSError:
+            continue
+        entries.append({
+            "src": str(item.src),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "mime_type": item.mime_type,
+            "exif_tag_used": item.exif_tag_used,
+            "exif_date": item.exif_date.isoformat() if item.exif_date else None,
+            "sidecars": [str(p) for p in item.sidecars],
+        })
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(cache_path, entries)
+
+
+def _cache_entry_to_item(entry: dict[str, Any]) -> MediaItem:
+    """Reconstruct a MediaItem from a cache entry."""
+    dt = None
+    if entry.get("exif_date"):
+        dt = datetime.fromisoformat(entry["exif_date"])
+    return MediaItem(
+        src=Path(entry["src"]),
+        sidecars=tuple(Path(p) for p in entry.get("sidecars", [])),
+        exif_date=dt,
+        exif_tag_used=entry.get("exif_tag_used"),
+        mime_type=entry.get("mime_type"),
+    )
+
+
+def discover_media(
+    root: Path,
+    exclude_dirs: list[Path] | None = None,
+    cache_path: Path | None = None,
+) -> list[MediaItem]:
+    all_files = _walk_files_excluding(root, exclude_dirs or [])
+
+    # Filter by known media extensions before calling ExifTool.
+    media_files = [f for f in all_files if f.suffix.lower() in MEDIA_EXTS]
+
+    # Load scan cache: reuse results for files whose size+mtime haven't changed.
+    cache = _load_scan_cache(cache_path) if cache_path else {}
+    cached_items: list[MediaItem] = []
+    files_to_scan: list[Path] = []
+
+    for f in media_files:
+        key = str(f)
+        if key in cache:
+            entry = cache[key]
+            try:
+                st = f.stat()
+            except OSError:
+                files_to_scan.append(f)
                 continue
-            src = Path(directory) / filename
-            src = src.resolve()
-            mime = meta.get("MIMEType")
-            if not _is_media_mime(mime):
+            if st.st_size == entry.get("size") and st.st_mtime == entry.get("mtime"):
+                cached_items.append(_cache_entry_to_item(entry))
                 continue
-            dt, tag_used = _pick_best_date(meta)
-            items.append(
-                MediaItem(
-                    src=src,
-                    sidecars=_find_sidecars_for(src),
-                    exif_date=dt,
-                    exif_tag_used=tag_used,
-                    mime_type=mime,
+        files_to_scan.append(f)
+
+    if cached_items:
+        print(f"  {len(cached_items)} file(s) loaded from scan cache")
+
+    # Scan only the files not found in cache.
+    scanned_items: list[MediaItem] = []
+    if files_to_scan:
+        print(f"  {len(files_to_scan)} file(s) to scan with ExifTool...")
+        for batch in _batched(files_to_scan, 200):
+            metas = _run_exiftool_json(batch)
+            for meta in metas:
+                directory = meta.get("Directory")
+                filename = meta.get("FileName")
+                if not isinstance(directory, str) or not isinstance(filename, str) or not directory or not filename:
+                    continue
+                src = Path(directory) / filename
+                src = src.resolve()
+                mime = meta.get("MIMEType")
+                if not _is_media_mime(mime):
+                    continue
+                dt, tag_used = _pick_best_date(meta)
+                scanned_items.append(
+                    MediaItem(
+                        src=src,
+                        sidecars=_find_sidecars_for(src),
+                        exif_date=dt,
+                        exif_tag_used=tag_used,
+                        mime_type=mime,
+                    )
                 )
-            )
+
+    items = cached_items + scanned_items
+
+    # Update cache with all results.
+    if cache_path:
+        _save_scan_cache(cache_path, items)
+
     return items
 
 
@@ -361,6 +464,7 @@ def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
         "duplicates_skipped.json",
         "collisions.json",
         "collisions_applied.json",
+        "scan_cache.json",
     }
     for p in _walk_files(dest_root):
         if not p.is_file():
@@ -690,8 +794,9 @@ def main() -> int:
     except Exception:
         pass
 
+    scan_cache_path = logs_dir / "scan_cache.json"
     print("Scanning for media files...")
-    items = discover_media(src_root, exclude_dirs=exclude_dirs)
+    items = discover_media(src_root, exclude_dirs=exclude_dirs, cache_path=scan_cache_path)
     print(f"Found {len(items)} media file(s)")
 
     if not items:
