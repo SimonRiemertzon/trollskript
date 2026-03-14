@@ -438,13 +438,24 @@ def _make_entry(plan: PlannedCopy, **extra: Any) -> dict[str, Any]:
     return {"src": str(plan.src), "dst": str(plan.dst), "kind": plan.kind, "group_id": plan.group_id, **extra}
 
 
+def _files_match_fast(src: Path, dst: Path) -> bool:
+    """Check if src and dst likely refer to the same file using size + mtime (no content read)."""
+    try:
+        src_stat = src.stat()
+        dst_stat = dst.stat()
+    except OSError:
+        return False
+    return src_stat.st_size == dst_stat.st_size and src_stat.st_mtime == dst_stat.st_mtime
+
+
 def copy_with_policy(
     plans: list[PlannedCopy],
     dest_hash_index: dict[str, list[str]],
     base_out: Path,
     logs_dir: Path,
     collision_policy: str = "rename",
-) -> None:
+    verify: bool = False,
+) -> int:
     """
     Copy files according to plan, handling duplicates and collisions.
 
@@ -452,19 +463,61 @@ def copy_with_policy(
         - skip: don't copy files that would overwrite different content
         - rename: add suffix like _(1) to avoid collision
         - collisions: copy collisions to a separate collisions/ folder
+
+    verify: if False, use fast filename+size+mtime matching to skip already-copied files.
+            if True, use full SHA-256 hash comparison for all files.
+
+    Returns the number of files that were fast-skipped (0 when verify=True).
     """
     report: list[dict[str, Any]] = []
     duplicates: list[dict[str, Any]] = []
     collisions: list[dict[str, Any]] = []
+    fast_skipped = 0
 
     # Ensure deterministic: media first, then sidecars
     plans_sorted = sorted(plans, key=lambda p: (p.group_id, 0 if p.kind == "media" else 1, str(p.src)))
 
     seen_hashes: dict[str, str] = {h: paths[0] for h, paths in dest_hash_index.items() if paths}
 
+    # Invert the index to get instant path→hash lookups with no extra I/O.
+    dest_path_to_hash: dict[str, str] = {
+        path: h for h, paths in dest_hash_index.items() for path in paths
+    }
+
     for plan in plans_sorted:
         plan.dst.parent.mkdir(parents=True, exist_ok=True)
 
+        if plan.dst.exists():
+            # Fast path: if not verifying, use filename+size+mtime to skip instantly.
+            if not verify and _files_match_fast(plan.src, plan.dst):
+                fast_skipped += 1
+                report.append(_make_entry(plan, status="fast_skipped"))
+                continue
+
+            # Full hash comparison (verify mode, or fast check didn't match).
+            dst_hash = dest_path_to_hash.get(str(plan.dst))
+            if dst_hash is None:
+                try:
+                    dst_hash = _hash_file(plan.dst)
+                except OSError:
+                    dst_hash = None
+
+            try:
+                src_hash = _hash_file(plan.src)
+            except OSError as e:
+                report.append(_make_entry(plan, status="error", error=str(e)))
+                continue
+
+            if src_hash == dst_hash:
+                seen_hashes[src_hash] = str(plan.dst)
+                report.append(_make_entry(plan, status="already_present_same_content", hash=src_hash))
+                continue
+
+            collisions.append(_make_entry(plan, src_hash=src_hash, dst_hash=dst_hash))
+            report.append(_make_entry(plan, status="collision_deferred", hash=src_hash))
+            continue
+
+        # Destination does not exist: hash source and check for cross-path duplicates.
         try:
             src_hash = _hash_file(plan.src)
         except OSError as e:
@@ -474,19 +527,6 @@ def copy_with_policy(
         if src_hash in seen_hashes:
             duplicates.append(_make_entry(plan, existing=seen_hashes[src_hash], hash=src_hash))
             report.append(_make_entry(plan, status="skipped_duplicate", hash=src_hash))
-            continue
-
-        if plan.dst.exists():
-            try:
-                dst_hash = _hash_file(plan.dst)
-            except OSError:
-                dst_hash = None
-            if dst_hash == src_hash:
-                seen_hashes[src_hash] = str(plan.dst)
-                report.append(_make_entry(plan, status="already_present_same_content", hash=src_hash))
-                continue
-            collisions.append(_make_entry(plan, src_hash=src_hash, dst_hash=dst_hash))
-            report.append(_make_entry(plan, status="collision_deferred", hash=src_hash))
             continue
 
         shutil.copy2(plan.src, plan.dst)
@@ -548,6 +588,8 @@ def copy_with_policy(
 
         _write_json(logs_dir / "collisions_applied.json", applied)
 
+    return fast_skipped
+
 
 def parse_args() -> argparse.Namespace | None:
     # Interactive mode: no arguments provided (e.g., double-clicked on Windows)
@@ -561,6 +603,7 @@ def parse_args() -> argparse.Namespace | None:
             dest=dest,
             top_folder=None,
             collision_policy="rename",
+            verify=False,
             interactive=True,
         )
 
@@ -600,6 +643,12 @@ Examples:
         default="rename",
         help="How to handle filename collisions: rename (default, add suffix), skip, collisions (copy to collisions/)",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        default=False,
+        help="Use full SHA-256 hash comparison instead of fast filename+size+mtime matching",
+    )
     args = parser.parse_args()
     args.interactive = False  # CLI mode is not interactive
     return args
@@ -630,6 +679,8 @@ def main() -> int:
     print(f"Source: {src_root}")
     print(f"Destination: {base_out}")
     print(f"Collision policy: {args.collision_policy}")
+    if args.verify:
+        print("Verify mode: full SHA-256 hash comparison enabled")
 
     # Exclude destination from scan if it's inside source
     exclude_dirs: list[Path] = []
@@ -656,18 +707,26 @@ def main() -> int:
         if len(years_sorted) > 1:
             print(f"Note: Multiple years detected: {years_sorted}")
 
-    print("Indexing existing destination files for duplicate detection...")
-    dest_index = build_dest_hash_index(base_out)
-    print(f"Indexed {len(dest_index)} existing file(s)")
+    if args.verify:
+        print("Indexing existing destination files for duplicate detection...")
+        dest_index = build_dest_hash_index(base_out)
+        print(f"Indexed {len(dest_index)} existing file(s)")
+    else:
+        dest_index: dict[str, list[str]] = {}
 
     print("Copying files (non-destructive)...")
-    copy_with_policy(
+    fast_skipped = copy_with_policy(
         plans=plans,
         dest_hash_index=dest_index,
         base_out=base_out,
         logs_dir=logs_dir,
         collision_policy=args.collision_policy,
+        verify=args.verify,
     )
+
+    if fast_skipped > 0:
+        print(f"{fast_skipped} file(s) skipped (name/size/mtime match).")
+        print("Run with --verify to confirm with full hash check.")
 
     print(f"Done! Reports written to: {logs_dir}")
     return 0
