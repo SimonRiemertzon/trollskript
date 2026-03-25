@@ -1,0 +1,856 @@
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import shutil
+import string
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+from install import ensure_exiftool
+
+
+SIDECAR_EXTS = {".xmp", ".aae", ".thm", ".dop", ".pp3"}
+
+EXIF_DATE_TAGS_PRIORITY = [
+    "DateTimeOriginal",
+    "MediaCreateDate",
+    "CreateDate",
+    "TrackCreateDate",
+    "ModifyDate",
+]
+
+# Known media file extensions — used to pre-filter before calling ExifTool.
+# This avoids scanning system files, text files, databases, etc.
+MEDIA_EXTS = {
+    # Images (common + RAW)
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif",
+    ".avif", ".jxl", ".ico", ".svg",
+    # RAW formats
+    ".nef", ".cr2", ".cr3", ".arw", ".orf", ".rw2", ".raf", ".dng", ".pef", ".srw",
+    ".x3f", ".3fr", ".ari", ".bay", ".cap", ".crw", ".dcr", ".erf", ".fff", ".iiq",
+    ".k25", ".kdc", ".mef", ".mos", ".mrw", ".nrw", ".ptx", ".r3d", ".raw", ".rwl",
+    ".rwz", ".sr2", ".srf",
+    # Video
+    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
+    ".3gp", ".3g2", ".mts", ".m2ts", ".ts", ".vob", ".ogv", ".divx", ".asf",
+    # Audio
+    ".wav", ".mp3", ".aac", ".flac", ".ogg", ".wma", ".m4a", ".aiff", ".aif", ".opus",
+}
+
+
+@dataclass(frozen=True)
+class MediaItem:
+    src: Path
+    sidecars: tuple[Path, ...]
+    exif_date: datetime | None
+    exif_tag_used: str | None
+    mime_type: str | None
+
+
+@dataclass(frozen=True)
+class PlannedCopy:
+    src: Path
+    dst: Path
+    kind: str  # "media" | "sidecar"
+    group_id: str
+
+
+def _script_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _get_volume_label(drive: str) -> str:
+    """Get the volume label for a drive on Windows. Returns empty string on failure."""
+    if sys.platform != "win32":
+        return ""
+    volume_name_buf = ctypes.create_unicode_buffer(261)
+    result = ctypes.windll.kernel32.GetVolumeInformationW(
+        drive, volume_name_buf, 261, None, None, None, None, 0
+    )
+    return volume_name_buf.value if result else ""
+
+
+def _get_removable_drives() -> list[tuple[str, str]]:
+    """
+    Detect removable drives (USB drives, SD cards).
+    Returns list of (drive_path, volume_label) tuples.
+    """
+    if sys.platform == "win32":
+        drives = []
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for letter in string.ascii_uppercase:
+            if bitmask & 1:
+                drive = f"{letter}:\\"
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+                # DriveType 2 = DRIVE_REMOVABLE
+                if drive_type == 2:
+                    label = _get_volume_label(drive)
+                    drives.append((drive, label))
+            bitmask >>= 1
+        return drives
+    else:
+        # Linux/macOS: use lsblk to find only removable block devices (USB, SD cards)
+        drives = []
+        try:
+            result = subprocess.run(
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,HOTPLUG,LABEL"],
+                capture_output=True, text=True, check=True,
+            )
+            data = json.loads(result.stdout)
+
+            def _walk(devices: list) -> None:
+                for dev in devices:
+                    is_removable = dev.get("rm") or dev.get("hotplug")
+                    if is_removable and dev.get("mountpoint"):
+                        label = dev.get("label") or dev["name"]
+                        drives.append((dev["mountpoint"] + "/", label))
+                    _walk(dev.get("children") or [])
+
+            _walk(data.get("blockdevices", []))
+        except (FileNotFoundError, subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
+            pass
+        return drives
+
+
+def _run_interactive_mode() -> tuple[Path, Path] | None:
+    """
+    Interactive mode for Windows double-click usage.
+    Shows welcome message, lists removable drives, prompts user to select one.
+    Returns (source_path, dest_path) or None if cancelled/no drives found.
+    """
+    print("=" * 50)
+    print("  TrollSkript - Photo/Video Sorter")
+    print("=" * 50)
+    print()
+    print("This tool copies photos and videos from a removable")
+    print("drive (USB/SD card) into date-based folders.")
+    print()
+
+    dest = _script_dir()
+    print(f"Destination: {dest}")
+    print()
+
+    drives = _get_removable_drives()
+    if not drives:
+        print("No removable drives found!")
+        print("Please insert a USB drive or SD card and try again.")
+        return None
+
+    print("Available removable drives:")
+    for i, (drive_path, label) in enumerate(drives, 1):
+        display_label = f" ({label})" if label else ""
+        print(f"  {i}. {drive_path}{display_label}")
+    print()
+
+    while True:
+        try:
+            choice = input(f"Select drive [1-{len(drives)}] or 'q' to quit: ").strip()
+            if choice.lower() == "q":
+                print("Cancelled.")
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(drives):
+                src = Path(drives[idx][0])
+                print()
+                print(f"Source: {src}")
+                print(f"Destination: {dest}")
+                print()
+                return src, dest
+            else:
+                print(f"Please enter a number between 1 and {len(drives)}")
+        except ValueError:
+            print(f"Please enter a number between 1 and {len(drives)} or 'q' to quit")
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _run_exiftool_json(paths: list[Path]) -> list[dict[str, Any]]:
+    if not paths:
+        return []
+
+    cmd = [
+        ensure_exiftool(),
+        "-json",
+        "-api",
+        "largefilesupport=1",
+        "-fast",
+        "-charset",
+        "filename=utf8",
+        "-FileName",
+        "-Directory",
+        "-MIMEType",
+        *[f"-{t}" for t in EXIF_DATE_TAGS_PRIORITY],
+        "--",
+        *[str(p) for p in paths],
+    ]
+    try:
+        # Separate stdout (JSON) from stderr (warnings)
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ExifTool not found. Install `exiftool` (Linux: apt install libimage-exiftool-perl) "
+            "or place `exiftool.exe` next to this script (Windows)."
+        )
+
+    # Exit code 1 = minor errors (some files unreadable) but output is still valid.
+    # Exit code 2+ = fatal error.
+    if result.returncode >= 2:
+        stderr_msg = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ExifTool failed (exit code {result.returncode}): {stderr_msg}")
+
+    out = result.stdout
+    if not out.strip():
+        return []
+
+    # Parse JSON, handling potential encoding issues
+    try:
+        return json.loads(out.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        # Try to clean up the output - sometimes exiftool includes warnings
+        text = out.decode("utf-8", errors="replace")
+        # Find the JSON array bounds
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+        return []
+
+
+def _parse_exif_dt(value: str) -> datetime | None:
+    v = value.strip()
+    if not v:
+        return None
+    # common: "2025:01:01 12:34:56" or "2025:01:01 12:34:56+01:00"
+    for fmt in ("%Y:%m:%d %H:%M:%S%z", "%Y:%m:%d %H:%M:%S"):
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _pick_best_date(meta: dict[str, Any]) -> tuple[datetime | None, str | None]:
+    for tag in EXIF_DATE_TAGS_PRIORITY:
+        v = meta.get(tag)
+        if isinstance(v, str):
+            dt = _parse_exif_dt(v)
+            if dt is not None:
+                return dt, tag
+    return None, None
+
+
+def _is_media_mime(mime: str | None) -> bool:
+    if not mime:
+        return False
+    return mime.startswith("image/") or mime.startswith("video/") or mime.startswith("audio/")
+
+
+def _find_sidecars_for(src: Path) -> tuple[Path, ...]:
+    base = src.with_suffix("")
+    found: list[Path] = []
+    for ext in SIDECAR_EXTS:
+        p = Path(str(base) + ext)
+        if p.exists() and p.is_file():
+            found.append(p)
+    return tuple(found)
+
+
+def _walk_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            files.append(Path(dirpath) / fn)
+    return files
+
+
+def _walk_files_excluding(root: Path, exclude_dirs: list[Path]) -> list[Path]:
+    ex = [p.resolve() for p in exclude_dirs]
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dp = Path(dirpath).resolve()
+
+        # prune excluded subtrees
+        for d in list(dirnames):
+            cand = (dp / d).resolve()
+            if any(cand == e or str(cand).startswith(str(e) + os.sep) for e in ex):
+                dirnames.remove(d)
+
+        for fn in filenames:
+            files.append(dp / fn)
+    return files
+
+
+def _batched(it: list[Path], n: int) -> Iterable[list[Path]]:
+    for i in range(0, len(it), n):
+        yield it[i : i + n]
+
+
+def _load_scan_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
+    """Load cached scan results. Returns {src_path -> cache_entry}."""
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        return {entry["src"]: entry for entry in data if isinstance(entry, dict) and "src" in entry}
+    except (json.JSONDecodeError, OSError, KeyError):
+        return {}
+
+
+def _save_scan_cache(cache_path: Path, items: list[MediaItem]) -> None:
+    """Save scan results to cache, including file size and mtime for cache validation."""
+    entries = []
+    for item in items:
+        try:
+            st = item.src.stat()
+        except OSError:
+            continue
+        entries.append({
+            "src": str(item.src),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "mime_type": item.mime_type,
+            "exif_tag_used": item.exif_tag_used,
+            "exif_date": item.exif_date.isoformat() if item.exif_date else None,
+            "sidecars": [str(p) for p in item.sidecars],
+        })
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(cache_path, entries)
+
+
+def _cache_entry_to_item(entry: dict[str, Any]) -> MediaItem:
+    """Reconstruct a MediaItem from a cache entry."""
+    dt = None
+    if entry.get("exif_date"):
+        dt = datetime.fromisoformat(entry["exif_date"])
+    return MediaItem(
+        src=Path(entry["src"]),
+        sidecars=tuple(Path(p) for p in entry.get("sidecars", [])),
+        exif_date=dt,
+        exif_tag_used=entry.get("exif_tag_used"),
+        mime_type=entry.get("mime_type"),
+    )
+
+
+def discover_media(
+    root: Path,
+    exclude_dirs: list[Path] | None = None,
+    cache_path: Path | None = None,
+) -> list[MediaItem]:
+    all_files = _walk_files_excluding(root, exclude_dirs or [])
+
+    # Filter by known media extensions before calling ExifTool.
+    media_files = [f for f in all_files if f.suffix.lower() in MEDIA_EXTS]
+
+    # Load scan cache: reuse results for files whose size+mtime haven't changed.
+    cache = _load_scan_cache(cache_path) if cache_path else {}
+    cached_items: list[MediaItem] = []
+    files_to_scan: list[Path] = []
+
+    for f in media_files:
+        key = str(f)
+        if key in cache:
+            entry = cache[key]
+            try:
+                st = f.stat()
+            except OSError:
+                files_to_scan.append(f)
+                continue
+            if st.st_size == entry.get("size") and st.st_mtime == entry.get("mtime"):
+                cached_items.append(_cache_entry_to_item(entry))
+                continue
+        files_to_scan.append(f)
+
+    if cached_items:
+        print(f"  {len(cached_items)} file(s) loaded from scan cache")
+
+    # Scan only the files not found in cache.
+    scanned_items: list[MediaItem] = []
+    if files_to_scan:
+        print(f"  {len(files_to_scan)} file(s) to scan with ExifTool...")
+        for batch in _batched(files_to_scan, 200):
+            metas = _run_exiftool_json(batch)
+            for meta in metas:
+                directory = meta.get("Directory")
+                filename = meta.get("FileName")
+                if not isinstance(directory, str) or not isinstance(filename, str) or not directory or not filename:
+                    continue
+                src = Path(directory) / filename
+                src = src.resolve()
+                mime = meta.get("MIMEType")
+                if not _is_media_mime(mime):
+                    continue
+                dt, tag_used = _pick_best_date(meta)
+                scanned_items.append(
+                    MediaItem(
+                        src=src,
+                        sidecars=_find_sidecars_for(src),
+                        exif_date=dt,
+                        exif_tag_used=tag_used,
+                        mime_type=mime,
+                    )
+                )
+
+    items = cached_items + scanned_items
+
+    # Update cache with all results.
+    if cache_path:
+        _save_scan_cache(cache_path, items)
+
+    return items
+
+
+def _folder_for_item(base_out: Path, item: MediaItem) -> Path:
+    if item.exif_date is None:
+        return base_out / "unknown_date"
+
+    dt = item.exif_date
+    # If tz-aware, group by local date in that timezone; if naive, use as-is.
+    y, m, d = dt.year, dt.month, dt.day
+    return base_out / f"{y:04d}-{m:02d}-{d:02d} -"
+
+
+def _ensure_unique_path(dst: Path) -> Path:
+    if not dst.exists():
+        return dst
+    stem = dst.stem
+    suffix = dst.suffix
+    parent = dst.parent
+    for i in range(1, 10_000):
+        cand = parent / f"{stem}_({i}){suffix}"
+        if not cand.exists():
+            return cand
+    raise RuntimeError(f"Could not find a free name for: {dst}")
+
+
+def _hash_file(path: Path) -> str:
+    """Compute SHA-256 hash of a file (streaming, memory-efficient)."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_dest_hash_index(dest_root: Path) -> dict[str, list[str]]:
+    """
+    Returns hash -> [paths...] for files already present in destination.
+    """
+    idx: dict[str, list[str]] = {}
+    if not dest_root.exists():
+        return idx
+
+    skip_names = {
+        "found_files.txt",
+        "found_files.json",
+        "report.json",
+        "duplicates_skipped.json",
+        "collisions.json",
+        "collisions_applied.json",
+        "scan_cache.json",
+    }
+    for p in _walk_files(dest_root):
+        if not p.is_file():
+            continue
+        if p.name in skip_names:
+            continue
+        try:
+            hx = _hash_file(p)
+        except OSError:
+            continue
+        idx.setdefault(hx, []).append(str(p))
+    return idx
+
+
+def plan_copies(items: list[MediaItem], base_out: Path) -> tuple[list[PlannedCopy], set[int]]:
+    plans: list[PlannedCopy] = []
+    years_with_date: set[int] = set()
+
+    for item in items:
+        if item.exif_date is not None:
+            years_with_date.add(item.exif_date.year)
+        dst_dir = _folder_for_item(base_out, item)
+
+        group_id = hashlib.sha1(str(item.src).encode("utf-8", errors="replace")).hexdigest()[:12]
+        plans.append(
+            PlannedCopy(
+                src=item.src,
+                dst=dst_dir / item.src.name,
+                kind="media",
+                group_id=group_id,
+            )
+        )
+        for sc in item.sidecars:
+            plans.append(
+                PlannedCopy(
+                    src=sc,
+                    dst=dst_dir / sc.name,
+                    kind="sidecar",
+                    group_id=group_id,
+                )
+            )
+
+    return plans, years_with_date
+
+
+
+
+
+def _write_found_list(out_dir: Path, items: list[MediaItem]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    found_txt = out_dir / "found_files.txt"
+    found_json = out_dir / "found_files.json"
+
+    found_txt.write_text(
+        "\n".join(str(i.src) for i in items) + ("\n" if items else ""),
+        encoding="utf-8",
+    )
+    _write_json(
+        found_json,
+        [
+            {
+                "src": str(i.src),
+                "mime_type": i.mime_type,
+                "exif_tag_used": i.exif_tag_used,
+                "exif_date": i.exif_date.isoformat() if i.exif_date else None,
+                "sidecars": [str(p) for p in i.sidecars],
+            }
+            for i in items
+        ],
+    )
+
+
+def _make_entry(plan: PlannedCopy, **extra: Any) -> dict[str, Any]:
+    """Create a report/log entry with common fields from a PlannedCopy."""
+    return {"src": str(plan.src), "dst": str(plan.dst), "kind": plan.kind, "group_id": plan.group_id, **extra}
+
+
+def _files_match_fast(src: Path, dst: Path) -> bool:
+    """Check if src and dst likely refer to the same file using size + mtime (no content read)."""
+    try:
+        src_stat = src.stat()
+        dst_stat = dst.stat()
+    except OSError:
+        return False
+    return src_stat.st_size == dst_stat.st_size and src_stat.st_mtime == dst_stat.st_mtime
+
+
+def copy_with_policy(
+    plans: list[PlannedCopy],
+    dest_hash_index: dict[str, list[str]],
+    base_out: Path,
+    logs_dir: Path,
+    collision_policy: str = "rename",
+    verify: bool = False,
+) -> int:
+    """
+    Copy files according to plan, handling duplicates and collisions.
+
+    collision_policy: "skip" | "rename" | "collisions"
+        - skip: don't copy files that would overwrite different content
+        - rename: add suffix like _(1) to avoid collision
+        - collisions: copy collisions to a separate collisions/ folder
+
+    verify: if False, use fast filename+size+mtime matching to skip already-copied files.
+            if True, use full SHA-256 hash comparison for all files.
+
+    Returns the number of files that were fast-skipped (0 when verify=True).
+    """
+    report: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    collisions: list[dict[str, Any]] = []
+    fast_skipped = 0
+
+    # Ensure deterministic: media first, then sidecars
+    plans_sorted = sorted(plans, key=lambda p: (p.group_id, 0 if p.kind == "media" else 1, str(p.src)))
+
+    seen_hashes: dict[str, str] = {h: paths[0] for h, paths in dest_hash_index.items() if paths}
+
+    # Invert the index to get instant path→hash lookups with no extra I/O.
+    dest_path_to_hash: dict[str, str] = {
+        path: h for h, paths in dest_hash_index.items() for path in paths
+    }
+
+    for plan in plans_sorted:
+        plan.dst.parent.mkdir(parents=True, exist_ok=True)
+
+        if plan.dst.exists():
+            # Fast path: if not verifying, use filename+size+mtime to skip instantly.
+            if not verify and _files_match_fast(plan.src, plan.dst):
+                fast_skipped += 1
+                report.append(_make_entry(plan, status="fast_skipped"))
+                continue
+
+            # Full hash comparison (verify mode, or fast check didn't match).
+            dst_hash = dest_path_to_hash.get(str(plan.dst))
+            if dst_hash is None:
+                try:
+                    dst_hash = _hash_file(plan.dst)
+                except OSError:
+                    dst_hash = None
+
+            try:
+                src_hash = _hash_file(plan.src)
+            except OSError as e:
+                report.append(_make_entry(plan, status="error", error=str(e)))
+                continue
+
+            if src_hash == dst_hash:
+                seen_hashes[src_hash] = str(plan.dst)
+                report.append(_make_entry(plan, status="already_present_same_content", hash=src_hash))
+                continue
+
+            collisions.append(_make_entry(plan, src_hash=src_hash, dst_hash=dst_hash))
+            report.append(_make_entry(plan, status="collision_deferred", hash=src_hash))
+            continue
+
+        # Destination does not exist: hash source and check for cross-path duplicates.
+        try:
+            src_hash = _hash_file(plan.src)
+        except OSError as e:
+            report.append(_make_entry(plan, status="error", error=str(e)))
+            continue
+
+        if src_hash in seen_hashes:
+            duplicates.append(_make_entry(plan, existing=seen_hashes[src_hash], hash=src_hash))
+            report.append(_make_entry(plan, status="skipped_duplicate", hash=src_hash))
+            continue
+
+        shutil.copy2(plan.src, plan.dst)
+        seen_hashes[src_hash] = str(plan.dst)
+        report.append(_make_entry(plan, status="copied", hash=src_hash))
+
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(logs_dir / "report.json", report)
+    _write_json(logs_dir / "duplicates_skipped.json", duplicates)
+    _write_json(logs_dir / "collisions.json", collisions)
+
+    # Handle collisions according to policy
+    if collisions:
+        print(f"Found {len(collisions)} collision(s), applying policy: {collision_policy}")
+        collisions_dir = base_out / "collisions"
+        if collision_policy == "collisions":
+            collisions_dir.mkdir(parents=True, exist_ok=True)
+
+        # Track media file renames so sidecars can follow: group_id -> (old_stem, new_stem, new_parent)
+        media_renames: dict[str, tuple[str, str, Path]] = {}
+
+        # First pass: process media files to determine renames
+        applied: list[dict[str, Any]] = []
+        for c in collisions:
+            src = Path(c["src"])
+            dst = Path(c["dst"])
+            src_hash = c["src_hash"]
+            kind = c["kind"]
+            group_id = c["group_id"]
+
+            if src_hash in seen_hashes:
+                applied.append({**c, "final_status": "skipped_duplicate_after_policy", "final_dst": None})
+                continue
+
+            if collision_policy == "skip":
+                applied.append({**c, "final_status": "skipped_collision", "final_dst": None})
+                continue
+
+            # Determine final destination
+            if kind == "sidecar" and group_id in media_renames:
+                # Sidecar follows its media file's rename
+                old_stem, new_stem, new_parent = media_renames[group_id]
+                new_name = dst.name.replace(old_stem, new_stem, 1)
+                final_dst = new_parent / new_name
+                final_dst = _ensure_unique_path(final_dst)
+            elif collision_policy == "rename":
+                final_dst = _ensure_unique_path(dst)
+            else:
+                final_dst = _ensure_unique_path(collisions_dir / dst.name)
+
+            # Track media file renames for sidecars to follow
+            if kind == "media" and final_dst.stem != dst.stem:
+                media_renames[group_id] = (dst.stem, final_dst.stem, final_dst.parent)
+
+            final_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, final_dst)
+            seen_hashes[src_hash] = str(final_dst)
+            applied.append({**c, "final_status": "copied_after_collision", "final_dst": str(final_dst)})
+
+        _write_json(logs_dir / "collisions_applied.json", applied)
+
+    return fast_skipped
+
+
+def parse_args() -> argparse.Namespace | None:
+    # Interactive mode: no arguments provided (e.g., double-clicked on Windows)
+    if len(sys.argv) == 1:
+        result = _run_interactive_mode()
+        if result is None:
+            return None
+        src, dest = result
+        return argparse.Namespace(
+            src=src,
+            dest=dest,
+            top_folder=None,
+            collision_policy="rename",
+            verify=False,
+            interactive=True,
+        )
+
+    parser = argparse.ArgumentParser(
+        description="Sort photos/videos into YYYY/MM/DD folders based on EXIF metadata.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python trollskript.py --dest /path/to/sorted
+  python trollskript.py --src /photos/unsorted --dest /photos/sorted
+  python trollskript.py --dest ./output --top-folder "Vacation2024"
+  python trollskript.py --dest ./output --collision-policy collisions
+""",
+    )
+    parser.add_argument(
+        "--src",
+        type=Path,
+        default=None,
+        help="Source folder to scan (default: folder containing this script)",
+    )
+    parser.add_argument(
+        "--dest",
+        type=Path,
+        required=True,
+        help="Destination folder for sorted media",
+    )
+    parser.add_argument(
+        "--top-folder",
+        type=str,
+        default=None,
+        help="Use a custom top folder name instead of year-based folders (e.g., 'Vacation2024')",
+    )
+    parser.add_argument(
+        "--collision-policy",
+        type=str,
+        choices=["skip", "rename", "collisions"],
+        default="rename",
+        help="How to handle filename collisions: rename (default, add suffix), skip, collisions (copy to collisions/)",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        default=False,
+        help="Use full SHA-256 hash comparison instead of fast filename+size+mtime matching",
+    )
+    args = parser.parse_args()
+    args.interactive = False  # CLI mode is not interactive
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if args is None:
+        return 0  # User cancelled interactive mode
+
+    # Source: command line or script directory
+    src_root = args.src.resolve() if args.src else _script_dir()
+    if not src_root.exists():
+        print(f"Error: Source folder does not exist: {src_root}")
+        return 1
+
+    dest_root = args.dest.resolve()
+
+    # Determine base output folder
+    if args.top_folder:
+        base_out = dest_root / args.top_folder
+    else:
+        base_out = dest_root
+
+    base_out.mkdir(parents=True, exist_ok=True)
+    logs_dir = base_out / ".trollskript"
+
+    print(f"Source: {src_root}")
+    print(f"Destination: {base_out}")
+    print(f"Collision policy: {args.collision_policy}")
+    if args.verify:
+        print("Verify mode: full SHA-256 hash comparison enabled")
+
+    # Exclude destination from scan if it's inside source
+    exclude_dirs: list[Path] = []
+    try:
+        if base_out == src_root or str(base_out).startswith(str(src_root) + os.sep):
+            exclude_dirs.append(base_out)
+    except Exception:
+        pass
+
+    scan_cache_path = logs_dir / "scan_cache.json"
+    print("Scanning for media files...")
+    items = discover_media(src_root, exclude_dirs=exclude_dirs, cache_path=scan_cache_path)
+    print(f"Found {len(items)} media file(s)")
+
+    if not items:
+        print("No media files found. Exiting.")
+        return 0
+
+    _write_found_list(logs_dir, items)
+
+    plans, years_with_date = plan_copies(items, base_out=base_out)
+
+    if years_with_date:
+        years_sorted = sorted(years_with_date)
+        if len(years_sorted) > 1:
+            print(f"Note: Multiple years detected: {years_sorted}")
+
+    if args.verify:
+        print("Indexing existing destination files for duplicate detection...")
+        dest_index = build_dest_hash_index(base_out)
+        print(f"Indexed {len(dest_index)} existing file(s)")
+    else:
+        dest_index: dict[str, list[str]] = {}
+
+    print("Copying files (non-destructive)...")
+    fast_skipped = copy_with_policy(
+        plans=plans,
+        dest_hash_index=dest_index,
+        base_out=base_out,
+        logs_dir=logs_dir,
+        collision_policy=args.collision_policy,
+        verify=args.verify,
+    )
+
+    if fast_skipped > 0:
+        print(f"{fast_skipped} file(s) skipped (name/size/mtime match).")
+        print("Run with --verify to confirm with full hash check.")
+
+    print(f"Done! Reports written to: {logs_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+	interactive_mode = len(sys.argv) == 1
+
+	if interactive_mode:
+		try:
+			exit_code = main()
+		except Exception as e:
+			print(f"\nError: {e}")
+			exit_code = 1
+		# Keep console window open when double-clicked on Windows (interactive mode)
+		print()
+		input("Press Enter to exit...")
+		raise SystemExit(exit_code)
+
+	raise SystemExit(main())
+
+
